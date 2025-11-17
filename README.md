@@ -4,7 +4,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Compatible-green.svg)](https://github.com/comfyanonymous/ComfyUI)
 
-Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0), the powerful 80B parameter native multimodal image generation model
+Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0), the powerful 80B parameter native multimodal image generation model.
+
+> **🙏 Acknowledgment**: This project integrates the HunyuanImage-3.0 model developed by **Tencent Hunyuan Team** and uses their official system prompts. The model and original code are licensed under [Apache 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE). This integration code is separately licensed under CC BY-NC 4.0 for non-commercial use.
 
 ## 🎯 Features
 
@@ -256,7 +258,7 @@ python hunyuan_quantize_nf4.py \
 - VRAM usage: ~70GB + 10GB distributed
 
 **RTX 6000 Blackwell (96GB) - Full BF16:**
-- Load time: ~50 seconds
+- Load time: ~25 seconds
 - 1024x1024 @ 50 steps: ~3 seconds/step
 - VRAM usage: ~80GB
 
@@ -366,9 +368,20 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 
 ## 🙏 Credits
 
+### ComfyUI Integration
 - **Author**: Eric Hiss ([GitHub: EricRollei](https://github.com/ericRollei/))
-- **Tencent Hunyuan Team** for the incredible HunyuanImage-3.0 model
-- **ComfyUI Community** for the excellent framework
+- **License**: CC BY-NC 4.0 (Non-Commercial) / Commercial License Available
+
+### HunyuanImage-3.0 Model
+- **Developed by**: Tencent Hunyuan Team
+- **Official Repository**: [Tencent-Hunyuan/HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0)
+- **Model License**: [Apache License 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)
+- **Paper**: [HunyuanImage 3.0 Technical Report](https://arxiv.org/pdf/2509.23951)
+- This integration uses the official HunyuanImage-3.0 system prompts and model architecture developed by Tencent
+
+### Special Thanks
+- **Tencent Hunyuan Team** for creating and open-sourcing the incredible HunyuanImage-3.0 model
+- **ComfyUI Community** for the excellent extensible framework
 - All contributors and testers
 
 ## 🆘 Support

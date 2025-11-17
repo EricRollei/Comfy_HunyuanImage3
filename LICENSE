@@ -65,13 +65,34 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 **HunyuanImage-3.0 Model License**
 
-The HunyuanImage-3.0 model is licensed under Apache License 2.0 by Tencent.
-This license applies only to the ComfyUI integration code in this repository,
-not to the model weights or architecture.
+The HunyuanImage-3.0 model is developed by Tencent Hunyuan Team and is licensed under 
+Apache License 2.0.
 
-For the model license, see: https://huggingface.co/tencent/HunyuanImage-3.0
+Official Repository: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0
+Model License: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
+Model on Hugging Face: https://huggingface.co/tencent/HunyuanImage-3.0
+
+This ComfyUI integration code is licensed separately (as described above) and only covers
+the integration layer. The model weights, architecture, and official system prompts remain
+under Tencent's Apache 2.0 license.
+
+**Attribution**
+
+This project uses code and system prompts from the official HunyuanImage-3.0 repository:
+- Official prompt engineering system prompts (en_recaption, en_think_recaption)
+- Model loading and generation patterns adapted from Tencent's implementation
+
+Copyright (c) 2024 Tencent Hunyuan Team (for HunyuanImage-3.0 model and code)
+Copyright (c) 2025 Eric Hiss (for ComfyUI integration code)
 
 **Third-Party Dependencies**
 
-This software uses various third-party libraries, each with their own licenses.
-See requirements.txt and the respective library documentation for details.
+This software uses various third-party libraries, each with their own licenses:
+- transformers (Apache 2.0)
+- torch (BSD-style)
+- bitsandbytes (MIT)
+- Pillow (HPND)
+- requests (Apache 2.0)
+- numpy (BSD)
+
+See requirements.txt and the respective library documentation for full details.
