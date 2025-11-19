@@ -1,0 +1,98 @@
+# Dual License Agreement
+
+## Copyright Notice
+
+Copyright (c) 2025 Eric Hiss. All rights reserved.
+
+Author: Eric Hiss (GitHub: EricRollei)
+Contact: eric@historic.camera, eric@rollei.us
+
+---
+
+## License Options
+
+### 1. Non-Commercial Use License
+
+This work is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License.
+
+You are free to:
+- **Share** — copy and redistribute the material in any medium or format
+- **Adapt** — remix, transform, and build upon the material
+
+Under the following terms:
+- **Attribution** — You must give appropriate credit, provide a link to the license, and indicate if changes were made.
+- **NonCommercial** — You may not use the material for commercial purposes.
+- **No additional restrictions** — You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
+
+To view a copy of this license, visit:
+http://creativecommons.org/licenses/by-nc/4.0/
+
+Or send a letter to:
+Creative Commons
+PO Box 1866
+Mountain View, CA 94042
+USA
+
+### 2. Commercial Use License
+
+For commercial use of this software, a separate commercial license is required.
+
+**Commercial use includes but is not limited to:**
+- Using the software in a commercial product or service
+- Using the software to generate content for commercial purposes
+- Integrating the software into commercial workflows
+- Any use that generates direct or indirect revenue
+
+**To obtain a commercial license:**
+Please contact Eric Hiss at:
+- Email: eric@historic.camera or eric@rollei.us
+- GitHub: https://github.com/ericRollei/
+
+---
+
+## Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+## Additional Terms
+
+**HunyuanImage-3.0 Model License**
+
+The HunyuanImage-3.0 model is developed by Tencent Hunyuan Team and is licensed under 
+Apache License 2.0.
+
+Official Repository: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0
+Model License: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
+Model on Hugging Face: https://huggingface.co/tencent/HunyuanImage-3.0
+
+This ComfyUI integration code is licensed separately (as described above) and only covers
+the integration layer. The model weights, architecture, and official system prompts remain
+under Tencent's Apache 2.0 license.
+
+**Attribution**
+
+This project uses code and system prompts from the official HunyuanImage-3.0 repository:
+- Official prompt engineering system prompts (en_recaption, en_think_recaption)
+- Model loading and generation patterns adapted from Tencent's implementation
+
+Copyright (c) 2024 Tencent Hunyuan Team (for HunyuanImage-3.0 model and code)
+Copyright (c) 2025 Eric Hiss (for ComfyUI integration code)
+
+**Third-Party Dependencies**
+
+This software uses various third-party libraries, each with their own licenses:
+- transformers (Apache 2.0)
+- torch (BSD-style)
+- bitsandbytes (MIT)
+- Pillow (HPND)
+- requests (Apache 2.0)
+- numpy (BSD)
+
+See requirements.txt and the respective library documentation for full details.

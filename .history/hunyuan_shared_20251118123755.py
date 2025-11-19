@@ -379,9 +379,6 @@ class HunyuanImage3Unload:
         return {
             "required": {
                 "force_clear": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "trigger": ("*", {"default": None}),
             }
         }
 
@@ -391,7 +388,7 @@ class HunyuanImage3Unload:
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
 
-    def unload(self, force_clear, trigger=None):
+    def unload(self, force_clear):
         if torch.cuda.is_available():
             before_mem = {}
             for i in range(torch.cuda.device_count()):

@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../../hunyuan_quantization"
+		},
+		{
+			"path": "../../models/HunyuanImage-3"
+		},
+		{
+			"path": "../../models/HunyuanImage-3-NF4"
+		}
+	],
+	"settings": {}
+}

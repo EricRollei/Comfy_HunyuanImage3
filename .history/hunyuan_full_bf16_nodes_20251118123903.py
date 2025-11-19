@@ -540,7 +540,7 @@ class HunyuanImage3DualGPULoader:
                 logger.info("=" * 60)
                 logger.info("TOTAL: %.2f GiB used / %.2f GiB total", total_allocated, total_capacity)
 
-            HunyuanModelCache.store(model_path_str, model)
+            HunyuanModelCache.store(model_path_str, model, keep_in_cache)
             
             logger.info("=" * 60)
             logger.info("✓ Model loaded and ready for generation")
@@ -650,6 +650,7 @@ class HunyuanImage3SingleGPU88GB:
             "required": {
                 "model_name": (HunyuanImage3FullLoader._get_available_models(),),
                 "reserve_memory_gb": ("FLOAT", {"default": 14.0, "min": 8.0, "max": 24.0, "step": 0.5}),
+                "keep_in_cache": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -657,7 +658,7 @@ class HunyuanImage3SingleGPU88GB:
     FUNCTION = "load_model"
     CATEGORY = "HunyuanImage3"
 
-    def load_model(self, model_name, reserve_memory_gb):
+    def load_model(self, model_name, reserve_memory_gb, keep_in_cache):
         model_path = Path(folder_paths.models_dir) / model_name
         model_path_str = str(model_path)
 
@@ -719,7 +720,7 @@ class HunyuanImage3SingleGPU88GB:
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, target_device, skip_quantized_params=False)
 
-            HunyuanModelCache.store(model_path_str, model)
+            HunyuanModelCache.store(model_path_str, model, keep_in_cache)
 
             free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             allocated = (total_bytes - free_bytes) / 1024**3

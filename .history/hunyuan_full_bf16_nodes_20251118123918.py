@@ -719,7 +719,7 @@ class HunyuanImage3SingleGPU88GB:
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, target_device, skip_quantized_params=False)
 
-            HunyuanModelCache.store(model_path_str, model)
+            HunyuanModelCache.store(model_path_str, model, keep_in_cache)
 
             free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             allocated = (total_bytes - free_bytes) / 1024**3

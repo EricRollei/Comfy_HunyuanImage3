@@ -328,8 +328,8 @@ class HunyuanImage3Generate:
             }
         }
     
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "*")
-    RETURN_NAMES = ("image", "rewritten_prompt", "status", "trigger")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("image", "rewritten_prompt", "status")
     FUNCTION = "generate"
     CATEGORY = "HunyuanImage3"
     
@@ -416,7 +416,7 @@ class HunyuanImage3Generate:
         image_tensor = torch.from_numpy(image_np).unsqueeze(0)
         
         logger.info(f"✓ Image generated successfully - tensor shape: {image_tensor.shape}")
-        return (image_tensor, rewritten_prompt, status_message, True)
+        return (image_tensor, rewritten_prompt, status_message)
 
     @classmethod
     def _default_resolution_label(cls) -> str:
@@ -777,8 +777,8 @@ class HunyuanImage3GenerateLarge:
             }
         }
     
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "*")
-    RETURN_NAMES = ("image", "rewritten_prompt", "status", "trigger")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("image", "rewritten_prompt", "status")
     FUNCTION = "generate_large"
     CATEGORY = "HunyuanImage3"
     
@@ -865,7 +865,7 @@ class HunyuanImage3GenerateLarge:
             # Update status to indicate large image mode
             status = f"Large image mode (CPU offload: {'enabled' if cpu_offload else 'disabled'}) - {status}"
             
-            return (image_tensor, rewritten_prompt, status, True)
+            return (image_tensor, rewritten_prompt, status)
             
         except RuntimeError as e:
             if "out of memory" in str(e).lower():

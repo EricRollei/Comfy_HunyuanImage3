@@ -865,7 +865,7 @@ class HunyuanImage3GenerateLarge:
             # Update status to indicate large image mode
             status = f"Large image mode (CPU offload: {'enabled' if cpu_offload else 'disabled'}) - {status}"
             
-            return (image_tensor, rewritten_prompt, status, True)
+            return (image_tensor, rewritten_prompt, status)
             
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
