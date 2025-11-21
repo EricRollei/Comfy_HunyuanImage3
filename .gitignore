@@ -143,3 +143,9 @@ Thumbs.db
 *.tmp
 temp/
 tmp/
+
+# API Configuration
+api_config.ini
+
+# Local History
+.history/
