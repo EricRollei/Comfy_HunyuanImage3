@@ -200,9 +200,17 @@ class HunyuanImage3FullGPULoader:
 
     @classmethod
     def INPUT_TYPES(cls):
+        gpu_options = ["cuda:0"]
+        if torch.cuda.is_available():
+            gpu_options = []
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                gpu_options.append(f"cuda:{i} ({props.name}, {props.total_memory/1024**3:.1f}GB)")
+        
         return {
             "required": {
                 "model_name": (cls._get_available_models(),),
+                "gpu_device": (gpu_options,),
                 "max_gpu_fraction": ("FLOAT", {"default": 0.9, "min": 0.5, "max": 0.99, "step": 0.01}),
                 "reserve_memory_gb": ("FLOAT", {"default": 8.0, "min": 2.0, "max": 32.0, "step": 0.5}),
             },
@@ -216,18 +224,40 @@ class HunyuanImage3FullGPULoader:
     def _get_available_models(cls):
         return HunyuanImage3FullLoader._get_available_models()
 
-    def load_model(self, model_name, max_gpu_fraction, reserve_memory_gb):
-        target_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    def load_model(self, model_name, gpu_device, max_gpu_fraction, reserve_memory_gb):
+        # Parse gpu index from string "cuda:0 (Name...)"
+        import re
+        device_index = 0
+        if isinstance(gpu_device, str):
+            match = re.match(r"cuda:(\d+)", gpu_device)
+            if match:
+                device_index = int(match.group(1))
+        
+        target_device = torch.device(f"cuda:{device_index}") if torch.cuda.is_available() else torch.device("cpu")
         model_path = Path(folder_paths.models_dir) / model_name
         model_path_str = str(model_path)
 
         cached = HunyuanModelCache.get(model_path_str)
         if cached is not None:
             self._apply_dtype_patches()
-            ensure_model_on_device(cached, target_device, skip_quantized_params=False)
-            return (cached,)
+            # Check if cached model is on the requested device
+            is_on_device = False
+            for param in cached.parameters():
+                if param.device.type == 'cuda' and param.device.index == device_index:
+                    is_on_device = True
+                    break
+                # Just check first param
+                break
+            
+            if is_on_device:
+                logger.info(f"Using cached model (already on cuda:{device_index})")
+                return (cached,)
+            else:
+                logger.info(f"Cached model is on different device, moving to cuda:{device_index}...")
+                ensure_model_on_device(cached, target_device, skip_quantized_params=False)
+                return (cached,)
 
-        logger.info("Loading FULL BF16 model (single GPU forcing): %s", model_name)
+        logger.info(f"Loading FULL BF16 model on {target_device}: {model_name}")
         if target_device.type != "cuda":
             logger.warning("CUDA not available; falling back to CPU load")
 
@@ -389,6 +419,7 @@ class HunyuanImage3DualGPULoader:
                 "reserve_memory_gb": ("FLOAT", {"default": 12.0, "min": 2.0, "max": 32.0, "step": 0.5}),
             },
             "optional": {
+                "exclude_gpus": ("STRING", {"default": "", "placeholder": "e.g. 1, 3 (comma separated indices)"}),
                 "info": ("STRING", {"default": "\n".join(gpu_info) if gpu_info else "No CUDA GPUs detected", "multiline": True}),
             }
         }
@@ -401,7 +432,7 @@ class HunyuanImage3DualGPULoader:
     def _get_available_models(cls):
         return HunyuanImage3FullLoader._get_available_models()
 
-    def load_model(self, model_name, primary_gpu, reserve_memory_gb, info=None):
+    def load_model(self, model_name, primary_gpu, reserve_memory_gb, exclude_gpus="", info=None):
         import os
         
         model_path = Path(folder_paths.models_dir) / model_name
@@ -461,10 +492,20 @@ class HunyuanImage3DualGPULoader:
         logger.info("MULTI-GPU CONFIGURATION")
         logger.info("=" * 60)
         
-        # Handle single GPU fallback
-        gpus_to_use = max(num_gpus, 1)
-        
-        for i in range(gpus_to_use):
+        # Parse excluded GPUs
+        excluded_indices = []
+        if exclude_gpus:
+            try:
+                excluded_indices = [int(x.strip()) for x in exclude_gpus.split(",") if x.strip()]
+                logger.info(f"Excluding GPUs: {excluded_indices}")
+            except ValueError:
+                logger.warning("Invalid format for exclude_gpus, ignoring")
+
+        for i in range(num_gpus):
+            if i in excluded_indices:
+                logger.info(f"Skipping GPU {i} (excluded by user)")
+                continue
+
             try:
                 props = torch.cuda.get_device_properties(i)
                 total_mem = props.total_memory
@@ -507,7 +548,7 @@ class HunyuanImage3DualGPULoader:
         max_memory["cpu"] = "20GiB"  # Fallback to CPU if needed
         
         logger.info("=" * 60)
-        logger.info("Total VRAM available for model: %.2f GiB across %d GPUs", total_available / 1024**3, num_gpus)
+        logger.info("Total VRAM available for model: %.2f GiB across %d GPUs", total_available / 1024**3, num_gpus - len(excluded_indices))
         logger.info("Loading FULL BF16 model: %s", model_name)
         logger.info("This will distribute layers across available GPUs automatically")
         logger.info("=" * 60)
