@@ -398,37 +398,126 @@ class HunyuanImage3Unload:
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Always re-run this node to ensure VRAM is cleared when requested
+        return float("nan")
+
     def unload(self, force_clear, trigger=None):
-        if torch.cuda.is_available():
-            before_mem = {}
-            for i in range(torch.cuda.device_count()):
-                free, total = torch.cuda.mem_get_info(i)
-                before_mem[i] = (total - free) / 1024**3
+        cleared = False
+        if force_clear:
+            cleared = HunyuanModelCache.clear()
         
-        released = HunyuanModelCache.clear()
-        
-        if torch.cuda.is_available():
-            logger.info("="*60)
-            logger.info("VRAM USAGE AFTER UNLOAD")
-            logger.info("="*60)
-            for i in range(torch.cuda.device_count()):
-                free, total = torch.cuda.mem_get_info(i)
-                after_used = (total - free) / 1024**3
-                before_used = before_mem.get(i, 0)
-                freed = before_used - after_used
-                logger.info(
-                    "GPU %d: %.2f GiB used (freed %.2f GiB) / %.2f GiB total",
-                    i, after_used, freed, total / 1024**3
-                )
-            logger.info("="*60)
-        
-        if released:
-            logger.info("✓ Hunyuan cache cleared via unload node")
-        else:
-            logger.info("Cache already empty, cleared CUDA cache only")
-        
-        # Return a unique value each time to force downstream loaders to re-execute
+        # Return a signal that changes to force downstream nodes to re-evaluate if needed
         import time
-        unload_signal = time.time()
+        return (cleared, float(time.time()))
+
+
+def patch_hunyuan_generate_image(model):
+    """
+    Monkey-patch the generate_image method on the model instance to correctly handle
+    callback_on_step_end by only passing it to the final image generation step.
+    This fixes issues where the callback is passed to text generation steps (CoT, ratio)
+    which causes a ValueError in transformers.
+    """
+    import sys
+    import types
+    
+    # Get the module where the model is defined to access its globals
+    model_module = sys.modules[model.__class__.__module__]
+    get_system_prompt = getattr(model_module, "get_system_prompt", None)
+    t2i_system_prompts = getattr(model_module, "t2i_system_prompts", None)
+    default = getattr(model_module, "default", lambda val, d: val if val is not None else d)
+    
+    def new_generate_image(
+            self,
+            prompt,
+            seed=None,
+            image_size="auto",
+            use_system_prompt=None,
+            system_prompt=None,
+            bot_task=None,
+            stream=False,
+            **kwargs,
+    ):
+        max_new_tokens = kwargs.pop("max_new_tokens", 8192)
+        verbose = kwargs.pop("verbose", 0)
+
+        # Extract callback_on_step_end so we can pass it ONLY to the final image gen step
+        callback_on_step_end = kwargs.pop("callback_on_step_end", None)
+
+        if stream:
+            from transformers import TextStreamer
+            streamer = TextStreamer(self._tkwrapper.tokenizer, skip_prompt=True, skip_special_tokens=False)
+            kwargs["streamer"] = streamer
+
+        use_system_prompt = default(use_system_prompt, self.generation_config.use_system_prompt)
+        bot_task = default(bot_task, self.generation_config.bot_task)
+        system_prompt = get_system_prompt(use_system_prompt, bot_task, system_prompt)
+
+        if bot_task in ["think", "recaption"]:
+            # Cot
+            model_inputs = self.prepare_model_inputs(
+                prompt=prompt, bot_task=bot_task, system_prompt=system_prompt, max_new_tokens=max_new_tokens)
+            print(f"<{bot_task}>", end="", flush=True)
+            # Do NOT pass callback_on_step_end here
+            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            cot_text = self.get_cot_text(outputs[0])
+            # Switch system_prompt to `en_recaption` if drop_think is enabled.
+            if self.generation_config.drop_think and system_prompt:
+                system_prompt = t2i_system_prompts["en_recaption"][0]
+        else:
+            cot_text = None
+
+        # Image ratio
+        if image_size == "auto":
+            model_inputs = self.prepare_model_inputs(
+                prompt=prompt, cot_text=cot_text, bot_task="img_ratio", system_prompt=system_prompt, seed=seed)
+            # Do NOT pass callback_on_step_end here
+            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            ratio_index = outputs[0, -1].item() - self._tkwrapper.ratio_token_offset
+            # In some cases, the generated ratio_index is out of range. A valid ratio_index should be in [0, 32].
+            # If ratio_index is out of range, we set it to 16 (i.e., 1:1).
+            if ratio_index < 0 or ratio_index >= len(self.image_processor.reso_group):
+                ratio_index = 16
+            reso = self.image_processor.reso_group[ratio_index]
+            image_size = reso.height, reso.width
+
+        # Generate image
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt, cot_text=cot_text, system_prompt=system_prompt, mode="gen_image", seed=seed,
+            image_size=image_size,
+        )
         
-        return (released, unload_signal)
+        # Ensure we don't pass callback_on_step_end if it's None, just to be safe
+        gen_kwargs = kwargs.copy()
+        if callback_on_step_end is not None:
+            gen_kwargs["callback_on_step_end"] = callback_on_step_end
+            
+        # PASS callback_on_step_end here
+        outputs = self._generate(**model_inputs, **gen_kwargs, verbose=verbose)
+        return outputs[0]
+
+    logger.info("Patching model.generate_image to support progress bars...")
+    model.generate_image = types.MethodType(new_generate_image, model)
+
+    # Also patch the pipeline class to extract callback_on_step_end from model_kwargs
+    # This is needed because the cached _generate method puts everything into model_kwargs
+    if hasattr(model, 'pipeline'):
+        pipeline_class = model.pipeline.__class__
+        if not getattr(pipeline_class, '_is_patched_for_comfy', False):
+            logger.info("Patching HunyuanImage3Text2ImagePipeline to handle callback_on_step_end...")
+            original_call = pipeline_class.__call__
+            
+            def new_pipeline_call(self, *args, **kwargs):
+                model_kwargs = kwargs.get('model_kwargs')
+                if model_kwargs and isinstance(model_kwargs, dict):
+                    if 'callback_on_step_end' in model_kwargs:
+                        cb = model_kwargs.pop('callback_on_step_end')
+                        # Only set it if not already provided explicitly
+                        if kwargs.get('callback_on_step_end') is None:
+                            kwargs['callback_on_step_end'] = cb
+                return original_call(self, *args, **kwargs)
+            
+            pipeline_class.__call__ = new_pipeline_call
+            pipeline_class._is_patched_for_comfy = True

@@ -34,12 +34,14 @@ import torch
 import folder_paths
 from PIL import Image
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from comfy.utils import ProgressBar
 
 from .hunyuan_shared import (
     HunyuanImage3Unload,
     HunyuanModelCache,
     ensure_model_on_device,
     patch_dynamic_cache_dtype,
+    patch_hunyuan_generate_image,
 )
 from .hunyuan_api_config import get_api_config
 
@@ -195,6 +197,7 @@ class HunyuanImage3QuantizedLoader:
                     elif cached is not None:
                         logger.info("Using cached model from previous load")
                         self._apply_dtype_patches()
+                        patch_hunyuan_generate_image(cached)
                         ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
                         return (cached,)
             except Exception as e:
@@ -298,6 +301,7 @@ class HunyuanImage3QuantizedLoader:
             model.load_tokenizer(model_path_str)
 
             self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
 
             if hasattr(model, "vae"):
                 target_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
@@ -388,11 +392,12 @@ class HunyuanImage3Generate:
         return {
             "required": {
                 "model": ("HUNYUAN_MODEL",),
-                "prompt": ("STRING", {"multiline": True, "default": "A serene landscape"}),
+                "prompt": ("STRING", {"multiline": True, "default": "A beautiful landscape"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "steps": ("INT", {"default": 25, "min": 1, "max": 100}),
                 "resolution": (cls._resolution_choices(),),
-                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.5}),
+                "guidance_scale": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 20.0, "step": 0.1}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
@@ -408,7 +413,7 @@ class HunyuanImage3Generate:
     FUNCTION = "generate"
     CATEGORY = "HunyuanImage3"
     
-    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, 
+    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, keep_model_loaded=True,
                  enable_prompt_rewrite=False, rewrite_style="none", 
                  api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
         # Validate model has valid device placement before generation
@@ -487,6 +492,17 @@ class HunyuanImage3Generate:
             "stream": True,
             "diff_guidance_scale": guidance_scale,
         }
+
+        # Progress bar callback
+        pbar = ProgressBar(steps)
+        def callback(pipe, step, timestep, callback_kwargs):
+            pbar.update(1)
+            return callback_kwargs
+        
+        # Only add callback if model supports it (patched models do)
+        # But to be safe against unpatched models, we can wrap it or check
+        # The patch_hunyuan_generate_image ensures it's handled, but if that failed...
+        gen_kwargs["callback_on_step_end"] = callback
         
         if resolution == self._default_resolution_label():
             logger.info("Using model default resolution")
@@ -524,6 +540,9 @@ class HunyuanImage3Generate:
         image_np = np.array(image).astype(np.float32) / 255.0
         image_tensor = torch.from_numpy(image_np).unsqueeze(0)
         
+        if not keep_model_loaded:
+            HunyuanModelCache.clear()
+
         logger.info(f"✓ Image generated successfully - tensor shape: {image_tensor.shape}")
         return (image_tensor, rewritten_prompt, status_message, True)
 
@@ -876,6 +895,7 @@ class HunyuanImage3GenerateLarge:
                 "resolution": (large_resolutions,),
                 "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.5}),
                 "cpu_offload": ("BOOLEAN", {"default": True}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
@@ -914,7 +934,7 @@ class HunyuanImage3GenerateLarge:
         
         return options
     
-    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, cpu_offload=True,
+    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, cpu_offload=True, keep_model_loaded=True,
                       enable_prompt_rewrite=False, rewrite_style="none",
                       api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
         
@@ -944,46 +964,10 @@ class HunyuanImage3GenerateLarge:
         logger.info(f"CPU Offload: {'Enabled' if cpu_offload else 'Disabled'}")
         logger.info("=" * 60)
         
-        # Handle prompt rewriting if enabled
-        original_prompt = prompt
-        rewritten_prompt = prompt
-        status_message = "Generation complete"
-        
-        if enable_prompt_rewrite and rewrite_style != "none":
-            # Get API config
-            config = get_api_config()
-            api_key = config.get("api_key")
-            
-            if api_key:
-                try:
-                    logger.info(f"Rewriting prompt using LLM API (style: {rewrite_style})...")
-                    api_config = {
-                        "url": api_url,
-                        "key": api_key,
-                        "model": model_name
-                    }
-                    prompt = self._rewrite_prompt_with_llm(prompt, rewrite_style, api_config)
-                    rewritten_prompt = prompt
-                    logger.info(f"Original prompt: {original_prompt[:80]}...")
-                    logger.info(f"Rewritten prompt: {prompt[:80]}...")
-                    status_message = f"Prompt rewritten using {rewrite_style}"
-                except Exception as e:
-                    logger.warning(f"Prompt rewriting failed: {e}, using original prompt")
-                    prompt = original_prompt
-                    rewritten_prompt = original_prompt
-                    status_message = f"Prompt rewriting failed: {str(e)[:100]}"
-            else:
-                logger.warning("Prompt rewrite enabled but no API key found in config/env.")
-                status_message = "Prompt rewrite skipped (missing API key)"
-        else:
-            status_message = "Using original prompt (no rewriting)"
-        
         # Temporarily enable CPU offload for this generation if requested
-        original_config = None
-        if cpu_offload and hasattr(model, 'config'):
+        if cpu_offload:
             try:
-                # Store original device map
-                original_device_map = getattr(model, 'hf_device_map', None)
+                from accelerate import cpu_offload as accelerate_cpu_offload
                 logger.info("Enabling CPU offload for large image generation...")
                 
                 # Free up some GPU memory
@@ -991,6 +975,14 @@ class HunyuanImage3GenerateLarge:
                     torch.cuda.empty_cache()
                     free, total = torch.cuda.mem_get_info(0)
                     logger.info(f"GPU memory before generation: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+
+                # Apply cpu_offload
+                # This moves the model to CPU and adds hooks to move layers to GPU during forward
+                accelerate_cpu_offload(model, execution_device="cuda:0")
+                logger.info("✓ CPU offload enabled via accelerate")
+                
+            except ImportError:
+                logger.warning("accelerate library not found, cannot enable CPU offload")
             except Exception as e:
                 logger.warning(f"Could not configure CPU offload: {e}")
         
@@ -1004,16 +996,16 @@ class HunyuanImage3GenerateLarge:
             parsed_resolution = resolution.split(" - ")[0]  # Extract WxH
         
         try:
-            image_tensor, rewritten_prompt, status = generator.generate(
+            image_tensor, rewritten_prompt, status, trigger = generator.generate(
                 model=model,
                 prompt=prompt,
                 seed=seed,
                 steps=steps,
                 resolution=parsed_resolution,
                 guidance_scale=guidance_scale,
+                keep_model_loaded=keep_model_loaded,
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
-                api_key=api_key,
                 api_url=api_url,
                 model_name=model_name
             )

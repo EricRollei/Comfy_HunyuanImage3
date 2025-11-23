@@ -33,6 +33,7 @@ from .hunyuan_shared import (
     HunyuanModelCache,
     ensure_model_on_device,
     patch_dynamic_cache_dtype,
+    patch_hunyuan_generate_image,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -154,6 +155,7 @@ class HunyuanImage3FullLoader:
             model.load_tokenizer(model_path_str)
 
             self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
 
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, torch.device("cuda:0"), skip_quantized_params=False)
@@ -341,6 +343,7 @@ class HunyuanImage3FullGPULoader:
             model.load_tokenizer(model_path_str)
 
             self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
 
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, target_device, skip_quantized_params=False)
@@ -584,6 +587,7 @@ class HunyuanImage3DualGPULoader:
             model.load_tokenizer(model_path_str)
 
             self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
 
             # Log device distribution
             logger.info("=" * 60)
@@ -748,6 +752,7 @@ class HunyuanImage3SingleGPU88GB:
         if cached is not None:
             logger.info("Using cached model")
             patch_dynamic_cache_dtype()
+            patch_hunyuan_generate_image(cached)
             ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
             return (cached,)
 
@@ -798,6 +803,7 @@ class HunyuanImage3SingleGPU88GB:
 
             logger.info("Applying dtype compatibility patches...")
             patch_dynamic_cache_dtype()
+            patch_hunyuan_generate_image(model)
 
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, target_device, skip_quantized_params=False)
