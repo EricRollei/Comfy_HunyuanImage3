@@ -36,6 +36,35 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 - Python 3.10+
 - PyTorch 2.7+ with CUDA 12.8+
 
+### System Requirements & Hardware Recommendations
+
+The hardware requirements depend heavily on which model version you use.
+
+#### 1. Full BF16 Model (Original)
+This is the uncompressed 80B parameter model. It is massive.
+- **Model Size**: ~160GB on disk.
+- **VRAM**: 
+  - **Ideal**: 80GB+ (A100, H100, RTX 6000 Ada). Runs entirely on GPU.
+  - **Minimum**: 24GB (RTX 3090/4090). *Requires massive System RAM.*
+- **System RAM (CPU Memory)**:
+  - If you have <80GB VRAM, the model weights that don't fit on GPU are stored in RAM.
+  - **Requirement**: **192GB+ System RAM** is recommended if using a 24GB card.
+  - *Example*: On a 24GB card, ~140GB of weights will live in RAM.
+- **Performance**:
+  - On low VRAM cards, generation will be slow due to swapping data between RAM and VRAM.
+
+#### 2. NF4 Quantized Model (Recommended)
+This version is compressed to 4-bit, reducing size by ~4x with minimal quality loss.
+- **Model Size**: ~45GB on disk.
+- **VRAM**:
+  - **Ideal**: 48GB+ (RTX 6000, A6000). Runs entirely on GPU.
+  - **Minimum**: 24GB (RTX 3090/4090).
+    - *Note*: Since 45GB > 24GB, about half the model will live in System RAM.
+    - **Performance**: Slower than 48GB cards, but functional.
+- **System RAM**: 
+  - **64GB+ recommended** (especially for 24GB VRAM cards to hold the offloaded weights).
+- **Performance**: Much faster on consumer hardware.
+
 ### Quick Install
 
 1. **Clone this repository** into your ComfyUI custom nodes folder:
@@ -59,9 +88,20 @@ cd ../../models
 huggingface-cli download tencent/HunyuanImage-3.0 --local-dir HunyuanImage-3
 ```
 
-**Option B: Quantize to NF4 (~20GB)** - *Recommended for single GPU <96GB*
+**Option B: Download Pre-Quantized NF4 Model (~20GB)** - *Recommended for single GPU <96GB*
+You can download the pre-quantized weights directly from Hugging Face:
+[EricRollei/HunyuanImage-3-NF4-ComfyUI](https://huggingface.co/EricRollei/HunyuanImage-3-NF4-ComfyUI)
+
 ```bash
-# First download full model, then quantize
+# Download to ComfyUI/models/
+cd ../../models
+huggingface-cli download EricRollei/HunyuanImage-3-NF4-ComfyUI --local-dir HunyuanImage-3-NF4
+```
+
+**Option C: Quantize Yourself (from Full Model)**
+If you prefer to quantize it yourself:
+```bash
+# First download full model (Option A), then quantize
 cd path/to/Eric_Hunyuan3/quantization
 python hunyuan_quantize_nf4.py \
   --model-path "../../models/HunyuanImage-3" \
@@ -80,11 +120,22 @@ python hunyuan_quantize_nf4.py \
 | **Hunyuan 3 Loader (Full BF16)** | Load full precision model | ~80GB | Moderate |
 | **Hunyuan 3 Loader (Full BF16 GPU)** | Single GPU with memory control | ~75GB+ | Moderate |
 | **Hunyuan 3 Loader (Multi-GPU BF16)** | Distribute across GPUs | 80GB total | Fast |
-| **Hunyuan 3 Loader (88GB GPU Optimized)** | For RTX 6000 Ada/Blackwell | ~75GB | Fastest |
+| **Hunyuan 3 Loader (88GB GPU Optimized)** | **DEPRECATED** - Use Full BF16 Loader | - | - |
 | **Hunyuan 3 Generate** | Standard generation (<2MP) | Varies | **Fast** ⚡ |
 | **Hunyuan 3 Generate (Large/Offload)** | Large images (2-8MP+) | Varies | Moderate |
 | **Hunyuan 3 Unload** | Free VRAM | - | Instant |
 | **Hunyuan 3 GPU Info** | Diagnostic/GPU detection | - | Instant |
+
+### Node Compatibility Guide
+
+**⚠️ IMPORTANT**: Match the Loader to the correct Generate node for stability.
+
+| Loader Node | Compatible Generate Node | Why? |
+|-------------|--------------------------|------|
+| **Hunyuan 3 Loader (NF4)** | **Hunyuan 3 Generate** | Keeps model on GPU. Best for standard sizes (<2MP). |
+| **Hunyuan 3 Loader (Full BF16)** | **Hunyuan 3 Generate (Large/Offload)** | Keeps model in RAM. Allows CPU offloading for massive images (4K+). |
+
+> **Do not mix them!** Using the NF4 Loader with the Large/Offload node will likely cause errors because the quantized model cannot be moved to CPU correctly.
 
 ### Basic Workflow
 
@@ -203,6 +254,20 @@ Settings:
   - reserve_memory_gb: 12.0
   - Automatically distributes across all GPUs
 ```
+
+### ⚡ Performance Optimization Guide
+
+To get the maximum speed and avoid unnecessary offloading (which slows down generation):
+
+1.  **Reserve Enough VRAM**:
+    *   Use the `reserve_memory_gb` slider in the Loader.
+    *   Set it high enough to cover the generation overhead for your target resolution (e.g., **30GB+ for 4K**).
+    *   *Why?* If you reserve space upfront, the model stays on the GPU. If you don't, the "Smart Offload" might panic and move everything to RAM to prevent a crash.
+
+2.  **Select Specific Resolutions**:
+    *   Avoid using "Auto (model default)" in the Large Generate node if you are optimizing for speed.
+    *   **Auto Mode Safety**: When "Auto" is selected, the node assumes a large resolution (~2.5MP) to be safe. This might trigger offloading even if your actual image is small.
+    *   **Specific Mode**: Selecting "1024x1024" tells the node *exactly* how much VRAM is needed, allowing it to skip offload if you have the space.
 
 ### LLM Prompt Rewriting (Optional)
 

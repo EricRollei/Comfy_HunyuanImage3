@@ -41,7 +41,14 @@ logger = logging.getLogger(__name__)
 
 
 class HunyuanImage3FullLoader:
-    """Loads FULL HunyuanImage-3.0 model in BF16 (no quantization)."""
+    """
+    Loads FULL HunyuanImage-3.0 model in BF16 (no quantization).
+    
+    Memory Reservation Guidelines (reserve_memory_gb):
+    - 1024x1024 (Standard): 6-8 GB
+    - 2048x2048 (2K): ~12 GB
+    - 4096x4096 (4K): ~30-40 GB
+    """
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -49,6 +56,13 @@ class HunyuanImage3FullLoader:
             "required": {
                 "model_name": (cls._get_available_models(),),
                 "force_reload": ("BOOLEAN", {"default": False}),
+                "reserve_memory_gb": ("FLOAT", {
+                    "default": 8.0, 
+                    "min": 2.0, 
+                    "max": 80.0, 
+                    "step": 0.5,
+                    "tooltip": "VRAM to leave free for generation. Recommended: 8GB (1K), 12GB (2K), 30GB+ (4K)."
+                }),
             },
             "optional": {
                 "unload_signal": ("*", {"default": None}),
@@ -80,7 +94,7 @@ class HunyuanImage3FullLoader:
         
         return available if available else ["HunyuanImage-3"]
     
-    def load_model(self, model_name, force_reload=False, unload_signal=None):
+    def load_model(self, model_name, force_reload=False, reserve_memory_gb=6.0, unload_signal=None):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
         model_path = Path(folder_paths.models_dir) / model_name
@@ -128,8 +142,25 @@ class HunyuanImage3FullLoader:
 
         model = None
         try:
+            # Calculate max memory to reserve space for activations
+            max_memory = None
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                # Reserve specified amount for generation overhead
+                reserve_bytes = int(reserve_memory_gb * 1024**3)
+                max_gpu_memory = free - reserve_bytes
+                
+                # Ensure we don't set a negative or too small limit
+                if max_gpu_memory < 4 * 1024**3:
+                    logger.warning(f"Reserved memory ({reserve_memory_gb}GB) leaves too little for model. Using minimum 4GB.")
+                    max_gpu_memory = 4 * 1024**3
+                
+                max_memory = {0: max_gpu_memory, "cpu": "100GiB"}
+                logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_memory_gb}GB)")
+
             load_kwargs = dict(
                 device_map="auto",
+                max_memory=max_memory,
                 trust_remote_code=True,
                 torch_dtype="auto",
                 attn_implementation="sdpa",
@@ -147,6 +178,7 @@ class HunyuanImage3FullLoader:
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path_str,
                     device_map="auto",
+                    max_memory=max_memory,
                     trust_remote_code=True,
                     torch_dtype=torch.bfloat16,
                 )

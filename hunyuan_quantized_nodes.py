@@ -122,6 +122,13 @@ class HunyuanImage3QuantizedLoader:
             "required": {
                 "model_name": (cls._get_available_models(),),
                 "force_reload": ("BOOLEAN", {"default": False}),
+                "reserve_memory_gb": ("FLOAT", {
+                    "default": 6.0, 
+                    "min": 2.0, 
+                    "max": 80.0, 
+                    "step": 0.5,
+                    "tooltip": "VRAM to leave free. Standard: 6GB. Large images (>2MP) need ~12GB/MP free (use Large Generate node to offload)."
+                }),
             },
             "optional": {
                 "unload_signal": ("*", {"default": None}),
@@ -150,7 +157,7 @@ class HunyuanImage3QuantizedLoader:
         
         return available if available else ["HunyuanImage-3-NF4"]
     
-    def load_model(self, model_name, force_reload=False, unload_signal=None):
+    def load_model(self, model_name, force_reload=False, unload_signal=None, reserve_memory_gb=6.0):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
         model_path = Path(folder_paths.models_dir) / model_name
@@ -264,8 +271,8 @@ class HunyuanImage3QuantizedLoader:
             max_memory_dict = None
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info(0)
-                # Reserve 8GB for generation overhead and leave 10% headroom
-                reserve_gb = 8.0
+                # Reserve specified amount for generation overhead and leave 10% headroom
+                reserve_gb = float(reserve_memory_gb)
                 headroom = 0.10
                 max_gpu_memory = int((total / 1024**3 - reserve_gb) * (1 - headroom) * 1024**3)
                 max_memory_dict = {0: max_gpu_memory, "cpu": "100GiB"}
@@ -415,27 +422,28 @@ class HunyuanImage3Generate:
     
     def generate(self, model, prompt, seed, steps, resolution, guidance_scale, keep_model_loaded=True,
                  enable_prompt_rewrite=False, rewrite_style="none", 
-                 api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
+                 api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", skip_device_check=False):
         # Validate model has valid device placement before generation
-        try:
-            has_valid_device = False
-            for param in model.parameters():
-                if param.device.type == 'cuda' and param.device.index is not None:
-                    has_valid_device = True
-                    break
-                elif param.device.type == 'cpu' or param.device.index is None:
-                    break
-            
-            if not has_valid_device:
-                raise RuntimeError(
-                    "Model has invalid device placement (likely cleared by Unload node). "
-                    "Please ensure the model loader runs before generation in your workflow. "
-                    "The model may have been unloaded by a previous Unload node."
-                )
-        except Exception as e:
-            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
-                raise
-            logger.warning(f"Could not validate model device: {e}")
+        if not skip_device_check:
+            try:
+                has_valid_device = False
+                for param in model.parameters():
+                    if param.device.type == 'cuda' and param.device.index is not None:
+                        has_valid_device = True
+                        break
+                    elif param.device.type == 'cpu' or param.device.index is None:
+                        break
+                
+                if not has_valid_device:
+                    raise RuntimeError(
+                        "Model has invalid device placement (likely cleared by Unload node). "
+                        "Please ensure the model loader runs before generation in your workflow. "
+                        "The model may have been unloaded by a previous Unload node."
+                    )
+            except Exception as e:
+                if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
+                    raise
+                logger.warning(f"Could not validate model device: {e}")
         
         logger.info(f"Generating image with {steps} steps")
         
@@ -508,12 +516,48 @@ class HunyuanImage3Generate:
             logger.info("Using model default resolution")
         else:
             height, width = self._parse_resolution(resolution)
+            # The model expects "height x width" string for image_size
+            # But wait, the model's internal logic might be parsing it differently or snapping it.
+            # Let's pass explicit width/height integers if possible, or ensure the string is correct.
+            # The pipeline usually takes width/height or image_size.
+            # Let's try passing width and height directly to be safe if the pipeline supports it,
+            # otherwise rely on the string.
+            # Based on Hunyuan code, it often snaps to buckets.
+            
+            # CRITICAL FIX: We must patch the resolution group to force our exact resolution
+            # just like we did in the Large node, otherwise it snaps to the nearest bucket.
+            # 1536x1920 (3MP) is snapping to 768x1024 (0.8MP) because it's the "closest" standard bucket
+            # if the 3MP buckets aren't in its default list.
+            
+            if hasattr(model, "image_processor") and hasattr(model.image_processor, "reso_group"):
+                reso_group = model.image_processor.reso_group
+                original_get_target_size = reso_group.get_target_size
+                
+                def new_get_target_size(w, h):
+                    # Force exact requested size
+                    return int(w), int(h)
+                
+                reso_group.get_target_size = new_get_target_size
+                logger.info("Applied resolution patch to bypass bucket snapping")
+                
+                # We need to restore this after generation
+                self._original_get_target_size = original_get_target_size
+                self._model_to_restore = model
+
             gen_kwargs["image_size"] = f"{height}x{width}"
             logger.info(f"Using custom resolution: {width}x{height}")
         
         logger.info(f"Guidance scale: {guidance_scale}")
         
-        image = model.generate_image(**gen_kwargs)
+        try:
+            image = model.generate_image(**gen_kwargs)
+        finally:
+            # Restore original method if we patched it
+            if hasattr(self, "_model_to_restore"):
+                self._model_to_restore.image_processor.reso_group.get_target_size = self._original_get_target_size
+                del self._model_to_restore
+                del self._original_get_target_size
+                logger.info("Restored original resolution logic")
 
         # Some configurations return an iterator of intermediate frames when streaming is enabled.
         if isinstance(image, (list, tuple)) and image:
@@ -553,85 +597,55 @@ class HunyuanImage3Generate:
     @classmethod
     def _resolution_choices(cls):
         if not hasattr(cls, "_RESOLUTION_CACHE"):
-            metadata = _resolution_metadata()
-            base_size = int(metadata["base_size"])
-            min_multiple = float(metadata["min_multiple"])
-            max_multiple = float(metadata["max_multiple"])
-            step = metadata["step"]
-            align = metadata["align"]
-            count_limit = int(metadata.get("count", 33))
-            step = int(step) if step is not None else None
-            align = int(align) if align else 1
+            # Standard resolutions for 1MP, 2MP, 3MP
+            # Sorted by Aspect Ratio: Tall -> Square -> Wide
+            # Aligned to 64 pixels (based on config.json image_resolution_align)
+            resolutions = [
+                # 1MP Class
+                (768, 1344, "9:16 (1.0MP)"),
+                (768, 1280, "5:8 (1.0MP)"),
+                (832, 1216, "2:3 (1.0MP)"),
+                (896, 1152, "3:4 (1.0MP)"),
+                (896, 1088, "4:5 (1.0MP)"),
+                (1024, 1024, "1:1 (1.0MP)"),
+                (1088, 896, "5:4 (1.0MP)"),
+                (1152, 896, "4:3 (1.0MP)"),
+                (1216, 832, "3:2 (1.0MP)"),
+                (1280, 768, "8:5 (1.0MP)"),
+                (1344, 768, "16:9 (1.0MP)"),
 
-            preset_pairs = []
-            if isinstance(metadata["presets"], list):
-                seen = set()
-                for entry in metadata["presets"]:
-                    if not isinstance(entry, str) or "x" not in entry:
-                        continue
-                    try:
-                        height_str, width_str = entry.split("x")
-                        pair = (int(height_str), int(width_str))
-                    except ValueError:
-                        continue
-                    if pair in seen:
-                        continue
-                    seen.add(pair)
-                    preset_pairs.append(pair)
+                # 2MP Class
+                (1088, 1856, "9:16 (2.0MP)"),
+                (1088, 1792, "5:8 (1.9MP)"),
+                (1152, 1728, "2:3 (2.0MP)"),
+                (1216, 1664, "3:4 (2.0MP)"),
+                (1280, 1600, "4:5 (2.0MP)"),
+                (1408, 1408, "1:1 (2.0MP)"),
+                (1600, 1280, "5:4 (2.0MP)"),
+                (1664, 1216, "4:3 (2.0MP)"),
+                (1728, 1152, "3:2 (2.0MP)"),
+                (1792, 1088, "8:5 (1.9MP)"),
+                (1856, 1088, "16:9 (2.0MP)"),
 
-            if not preset_pairs:
-                preset_pairs = cls._compute_resolutions(
-                    base_size,
-                    step=step,
-                    align=align,
-                    min_multiple=min_multiple,
-                    max_multiple=max_multiple,
-                    max_entries=count_limit,
-                )
-
-            # Organize resolutions: prioritize <2K, add descriptive labels
-            labeled_resolutions = []
-            for height, width in preset_pairs:
-                total_pixels = height * width
-                aspect = width / height
-                
-                # Determine orientation and size category
-                if abs(aspect - 1.0) < 0.1:
-                    orientation = "Square"
-                elif aspect > 1.0:
-                    orientation = "Landscape"
-                else:
-                    orientation = "Portrait"
-                
-                # Size category
-                if total_pixels < 1024 * 1024:
-                    size_cat = "<1MP"
-                elif total_pixels < 2048 * 2048:
-                    size_cat = "1-2MP"
-                else:
-                    size_cat = ">2MP"
-                
-                megapixels = total_pixels / (1024 * 1024)
-                label = f"{width}x{height} - {orientation} ({megapixels:.1f}MP) [{size_cat}]"
-                labeled_resolutions.append((height, width, label, total_pixels))
+                # 3MP Class
+                (1280, 2304, "9:16 (2.9MP)"),
+                (1344, 2176, "5:8 (2.9MP)"),
+                (1408, 2112, "2:3 (3.0MP)"),
+                (1472, 1984, "3:4 (2.9MP)"),
+                (1536, 1920, "4:5 (2.9MP)"),
+                (1728, 1728, "1:1 (3.0MP)"),
+                (1920, 1536, "5:4 (2.9MP)"),
+                (1984, 1472, "4:3 (2.9MP)"),
+                (2112, 1408, "3:2 (3.0MP)"),
+                (2176, 1344, "8:5 (2.9MP)"),
+                (2304, 1280, "16:9 (2.9MP)"),
+            ]
             
-            # Sort: <2MP first, then by aspect ratio within each group
-            labeled_resolutions.sort(key=lambda x: (x[3] >= 2048*2048, x[1] / x[0]))
-            
-            # Limit to reasonable count, keeping smaller sizes
-            if len(labeled_resolutions) > count_limit:
-                # Keep more <2MP options
-                under_2mp = [r for r in labeled_resolutions if r[3] < 2048*2048]
-                over_2mp = [r for r in labeled_resolutions if r[3] >= 2048*2048]
+            options = [cls._default_resolution_label()]
+            for w, h, label in resolutions:
+                options.append(f"{w}x{h} - {label}")
                 
-                keep_under = min(len(under_2mp), int(count_limit * 0.7))  # 70% for <2MP
-                keep_over = count_limit - keep_under
-                
-                labeled_resolutions = under_2mp[:keep_under] + over_2mp[:keep_over]
-            
-            cls._RESOLUTION_CACHE = tuple(
-                [cls._default_resolution_label()] + [label for _, _, label, _ in labeled_resolutions]
-            )
+            cls._RESOLUTION_CACHE = tuple(options)
         return cls._RESOLUTION_CACHE
 
     @staticmethod
@@ -883,18 +897,15 @@ class HunyuanImage3GenerateLarge:
     
     @classmethod
     def INPUT_TYPES(cls):
-        # Generate large resolution options (2MP+)
-        large_resolutions = cls._get_large_resolutions()
-        
         return {
             "required": {
                 "model": ("HUNYUAN_MODEL",),
-                "prompt": ("STRING", {"multiline": True, "default": "A serene landscape"}),
+                "prompt": ("STRING", {"multiline": True, "default": "A beautiful landscape"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
-                "resolution": (large_resolutions,),
-                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.5}),
-                "cpu_offload": ("BOOLEAN", {"default": True}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
+                "resolution": (cls._get_large_resolutions(),),
+                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.1}),
+                "offload_mode": (["smart", "always", "disabled"], {"default": "smart"}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -913,31 +924,57 @@ class HunyuanImage3GenerateLarge:
     
     @classmethod
     def _get_large_resolutions(cls):
-        """Generate resolution options focusing on 2MP+ sizes."""
-        common_large = [
-            (2048, 2048, "Square 4K", 4.2),
-            (2560, 1440, "Landscape 2K", 3.7),
-            (1440, 2560, "Portrait 2K", 3.7),
-            (2048, 1536, "Landscape 3MP", 3.1),
-            (1536, 2048, "Portrait 3MP", 3.1),
-            (2560, 1920, "Landscape HD+", 4.9),
-            (1920, 2560, "Portrait HD+", 4.9),
-            (3072, 2048, "Landscape 6MP", 6.3),
-            (2048, 3072, "Portrait 6MP", 6.3),
-            (3840, 2160, "Landscape 4K UHD", 8.3),
-            (2160, 3840, "Portrait 4K UHD", 8.3),
+        """Generate resolution options sorted by size then aspect ratio."""
+        resolutions = []
+        
+        # Define standard sizes to include
+        # Format: (width, height, label)
+        base_sizes = [
+            # 1MP Class (Standard)
+            (720, 1280, "Portrait 720p"),
+            (864, 1152, "Portrait 3:4"),
+            (1024, 1024, "Square 1K"),
+            (1152, 864, "Landscape 4:3"),
+            (1280, 720, "Landscape 720p"),
+            
+            # 2MP Class
+            (1080, 1920, "Portrait 1080p"),
+            (1200, 1600, "Portrait 3:4"),
+            (1440, 1440, "Square 1.5K"),
+            (1600, 1200, "Landscape 4:3"),
+            (1920, 1080, "Landscape 1080p"),
+            
+            # 4MP Class (2K)
+            (1440, 2560, "Portrait 2K"),
+            (1536, 2048, "Portrait 3:4"),
+            (2048, 2048, "Square 2K"),
+            (2048, 1536, "Landscape 4:3"),
+            (2560, 1440, "Landscape 2K"),
+            
+            # 9MP Class (3K/4K)
+            (2160, 3840, "Portrait 4K"),
+            (3072, 3072, "Square 3K"),
+            (3840, 2160, "Landscape 4K"),
+            
+            # Extreme
+            (4096, 4096, "Square 4K"),
         ]
         
         options = ["Auto (model default)"]
-        for width, height, desc, mp in common_large:
-            options.append(f"{width}x{height} - {desc} ({mp:.1f}MP)")
-        
+        for w, h, desc in base_sizes:
+            mp = (w * h) / 1_000_000
+            options.append(f"{w}x{h} - {desc} ({mp:.1f}MP)")
+            
         return options
     
-    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, cpu_offload=True, keep_model_loaded=True,
+    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
                       enable_prompt_rewrite=False, rewrite_style="none",
-                      api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
+                      api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", cpu_offload=None):
         
+        # Backward compatibility for cpu_offload boolean
+        if cpu_offload is not None:
+            offload_mode = "always" if cpu_offload else "disabled"
+
         # Validate model has valid device placement before generation
         try:
             has_valid_device = False
@@ -959,25 +996,78 @@ class HunyuanImage3GenerateLarge:
                 raise
             logger.warning(f"Could not validate model device: {e}")
         
+        # Parse resolution
+        generator = HunyuanImage3Generate()
+        if resolution == "Auto (model default)":
+            # Auto mode can be unpredictable and choose large resolutions (up to 2.5MP+)
+            # To be safe for Smart Offload, we assume a "worst case" standard resolution
+            # of ~2.5MP (e.g. 1600x1600) to ensure we offload if VRAM is tight.
+            width, height = 1600, 1600 
+            parsed_resolution = generator._default_resolution_label()
+            logger.info("Auto resolution selected: Assuming ~2.5MP for memory calculation safety.")
+        else:
+            parsed_resolution = resolution.split(" - ")[0]  # Extract WxH
+            width, height = map(int, parsed_resolution.split("x"))
+
+        # Smart Offload Logic
+        should_offload = False
+        if offload_mode == "always":
+            should_offload = True
+        elif offload_mode == "smart" and torch.cuda.is_available():
+            # Estimate memory requirements
+            megapixels = (width * height) / 1_000_000
+            # Empirical testing shows very high VRAM usage for activations
+            # 2.1MP -> ~24GB
+            # 3.1MP -> ~38GB
+            # Formula adjusted to: 2GB base + 12GB per MP to be safe
+            required_free_gb = 2.0 + (megapixels * 12.0)
+            
+            free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+            free_gb = free_bytes / 1024**3
+            
+            if free_gb < required_free_gb:
+                logger.info(f"Smart Offload: Free VRAM ({free_gb:.1f}GB) < Required ({required_free_gb:.1f}GB) for {megapixels:.1f}MP. Enabling offload.")
+                should_offload = True
+            else:
+                logger.info(f"Smart Offload: Sufficient VRAM ({free_gb:.1f}GB >= {required_free_gb:.1f}GB). Skipping offload for speed.")
+                should_offload = False
+        
         logger.info("=" * 60)
         logger.info("LARGE IMAGE GENERATION MODE")
-        logger.info(f"CPU Offload: {'Enabled' if cpu_offload else 'Disabled'}")
+        logger.info(f"Resolution: {width}x{height}")
+        logger.info(f"Offload Mode: {offload_mode} -> {'Enabled' if should_offload else 'Disabled'}")
         logger.info("=" * 60)
         
         # Temporarily enable CPU offload for this generation if requested
-        if cpu_offload:
+        if should_offload:
             try:
                 from accelerate import cpu_offload as accelerate_cpu_offload
                 logger.info("Enabling CPU offload for large image generation...")
                 
-                # Free up some GPU memory
+                # FORCE MOVE TO CPU FIRST
+                # This ensures VRAM is actually freed before we start offloading hooks
+                # If the model is currently on GPU (from FullLoader), this is critical.
+                logger.info("Moving model to CPU to ensure VRAM is free...")
+                
+                # Check for meta tensors first to avoid crash
+                has_meta = False
+                for param in model.parameters():
+                    if param.device.type == 'meta':
+                        has_meta = True
+                        break
+                
+                if has_meta:
+                    logger.info("Model has meta tensors (managed by accelerate), skipping manual .cpu() move.")
+                else:
+                    model.cpu()
+                    
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     free, total = torch.cuda.mem_get_info(0)
                     logger.info(f"GPU memory before generation: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
 
                 # Apply cpu_offload
-                # This moves the model to CPU and adds hooks to move layers to GPU during forward
+                # This moves the model to CPU (redundant but safe) and adds hooks to move layers to GPU during forward
                 accelerate_cpu_offload(model, execution_device="cuda:0")
                 logger.info("✓ CPU offload enabled via accelerate")
                 
@@ -986,15 +1076,26 @@ class HunyuanImage3GenerateLarge:
             except Exception as e:
                 logger.warning(f"Could not configure CPU offload: {e}")
         
-        # Use the standard generate logic from HunyuanImage3Generate
-        generator = HunyuanImage3Generate()
-        
-        # Parse resolution
-        if resolution == "Auto (model default)":
-            parsed_resolution = generator._default_resolution_label()
-        else:
-            parsed_resolution = resolution.split(" - ")[0]  # Extract WxH
-        
+        # Patch ResolutionGroup to allow arbitrary resolutions
+        # The model's image_processor snaps to the nearest bucket by default.
+        # We need to bypass this for large/custom resolutions.
+        original_get_target_size = None
+        if hasattr(model, "image_processor") and hasattr(model.image_processor, "reso_group"):
+            reso_group = model.image_processor.reso_group
+            original_get_target_size = reso_group.get_target_size
+            
+            def new_get_target_size(w, h):
+                # If exact match exists in buckets, use it (preserves standard behavior)
+                key = (int(round(h)), int(round(w)))
+                if key in reso_group._lookup:
+                    return reso_group._lookup[key].w, reso_group._lookup[key].h
+                # Otherwise return exact requested size
+                # This allows 4K etc. to pass through without being snapped to 1K
+                return int(w), int(h)
+            
+            reso_group.get_target_size = new_get_target_size
+            logger.info("Applied resolution patch to bypass bucket snapping")
+
         try:
             image_tensor, rewritten_prompt, status, trigger = generator.generate(
                 model=model,
@@ -1007,7 +1108,8 @@ class HunyuanImage3GenerateLarge:
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
                 api_url=api_url,
-                model_name=model_name
+                model_name=model_name,
+                skip_device_check=should_offload  # Skip check if offloading, as model will be on CPU
             )
             
             if torch.cuda.is_available():
@@ -1019,18 +1121,23 @@ class HunyuanImage3GenerateLarge:
             logger.info("=" * 60)
             
             # Update status to indicate large image mode
-            status = f"Large image mode (CPU offload: {'enabled' if cpu_offload else 'disabled'}) - {status}"
+            status = f"Large image mode (Offload: {offload_mode}) - {status}"
             
             return (image_tensor, rewritten_prompt, status, True)
             
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 logger.error("GPU Out of Memory! Try:")
-                logger.error("  1. Enable 'cpu_offload' (if not already)")
+                logger.error("  1. Set offload_mode to 'always'")
                 logger.error("  2. Use a smaller resolution")
                 logger.error("  3. Reduce guidance_scale or steps")
                 logger.error("  4. Clear GPU memory with Unload node first")
             raise
+        finally:
+            # Restore original method
+            if original_get_target_size is not None:
+                model.image_processor.reso_group.get_target_size = original_get_target_size
+                logger.info("Restored original resolution logic")
 
 
 NODE_CLASS_MAPPINGS = {
