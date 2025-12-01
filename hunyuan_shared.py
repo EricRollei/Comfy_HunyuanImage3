@@ -1020,7 +1020,11 @@ class HunyuanImage3ForceUnload:
                 }),
                 "nuke_orphaned_tensors": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "DANGEROUS: Hunt and destroy ALL CUDA tensors in memory. Use after OOM when memory is stuck."
+                    "tooltip": "DANGEROUS: Hunt and destroy ALL CUDA tensors in memory. Use after OOM when VRAM is stuck."
+                }),
+                "nuke_ram_tensors": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "DANGEROUS: Also hunt and destroy orphaned CPU tensors in RAM. Use when system RAM is full of leaked model weights."
                 }),
             },
             "optional": {
@@ -1040,7 +1044,7 @@ class HunyuanImage3ForceUnload:
 
     def force_unload(self, clear_all_models=True, aggressive_gc=True, 
                      reset_cuda_allocator=True, clear_comfy_cache=False,
-                     nuke_orphaned_tensors=False, trigger=None):
+                     nuke_orphaned_tensors=False, nuke_ram_tensors=False, trigger=None):
         import gc
         import time
         
@@ -1133,13 +1137,20 @@ class HunyuanImage3ForceUnload:
             except Exception as e:
                 report_lines.append(f"CUDA cleanup error: {e}")
         
-        # Step 5: NUCLEAR OPTION - Hunt and destroy orphaned CUDA tensors
-        if nuke_orphaned_tensors and torch.cuda.is_available():
+        # Step 5: NUCLEAR OPTION - Hunt and destroy orphaned tensors
+        if nuke_orphaned_tensors or nuke_ram_tensors:
             report_lines.append("--- NUCLEAR TENSOR HUNT ---")
+            if nuke_orphaned_tensors:
+                report_lines.append("Targeting: CUDA (VRAM) tensors")
+            if nuke_ram_tensors:
+                report_lines.append("Targeting: CPU (RAM) tensors")
+            
             try:
-                tensors_found = 0
+                cuda_tensors_found = 0
+                cpu_tensors_found = 0
                 tensors_cleared = 0
                 modules_found = 0
+                ram_freed_estimate = 0
                 
                 # Get all objects in memory
                 all_objects = gc.get_objects()
@@ -1149,43 +1160,64 @@ class HunyuanImage3ForceUnload:
                 for obj in all_objects:
                     try:
                         if isinstance(obj, torch.nn.Module):
+                            # Skip our cached model - we handle that separately
+                            if obj is HunyuanModelCache._cached_model:
+                                continue
                             modules_found += 1
                             # Clear all parameters
                             for param in obj.parameters():
-                                if param.device.type == 'cuda':
+                                if param.device.type == 'cuda' and nuke_orphaned_tensors:
+                                    ram_freed_estimate += param.numel() * param.element_size()
                                     param.data = torch.empty(0, device='cpu')
+                                    tensors_cleared += 1
+                                elif param.device.type == 'cpu' and nuke_ram_tensors:
+                                    ram_freed_estimate += param.numel() * param.element_size()
+                                    param.data = torch.empty(0)
                                     tensors_cleared += 1
                             # Clear all buffers
                             for buf in obj.buffers():
-                                if buf.device.type == 'cuda':
+                                if buf.device.type == 'cuda' and nuke_orphaned_tensors:
+                                    ram_freed_estimate += buf.numel() * buf.element_size()
                                     buf.data = torch.empty(0, device='cpu')
+                                    tensors_cleared += 1
+                                elif buf.device.type == 'cpu' and nuke_ram_tensors:
+                                    ram_freed_estimate += buf.numel() * buf.element_size()
+                                    buf.data = torch.empty(0)
                                     tensors_cleared += 1
                     except Exception:
                         pass
                 
-                # Second pass: Find raw CUDA tensors
+                # Second pass: Find raw tensors
                 for obj in all_objects:
                     try:
                         if isinstance(obj, torch.Tensor):
                             if obj.device.type == 'cuda':
-                                tensors_found += 1
-                                # Replace with empty CPU tensor
-                                obj.data = torch.empty(0, device='cpu')
-                                tensors_cleared += 1
+                                cuda_tensors_found += 1
+                                if nuke_orphaned_tensors:
+                                    ram_freed_estimate += obj.numel() * obj.element_size()
+                                    obj.data = torch.empty(0, device='cpu')
+                                    tensors_cleared += 1
+                            elif obj.device.type == 'cpu':
+                                cpu_tensors_found += 1
+                                if nuke_ram_tensors:
+                                    ram_freed_estimate += obj.numel() * obj.element_size()
+                                    obj.data = torch.empty(0)
+                                    tensors_cleared += 1
                     except Exception:
                         pass
                 
                 report_lines.append(f"Found {modules_found} nn.Module instances")
-                report_lines.append(f"Found {tensors_found} CUDA tensors")
-                report_lines.append(f"Cleared {tensors_cleared} tensors")
+                report_lines.append(f"Found {cuda_tensors_found} CUDA tensors, {cpu_tensors_found} CPU tensors")
+                report_lines.append(f"Cleared {tensors_cleared} tensors (~{ram_freed_estimate/1024**3:.2f}GB)")
                 
                 # Force cleanup after tensor hunting
                 del all_objects
                 for _ in range(5):
                     gc.collect()
                 
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
                 
                 report_lines.append("Nuclear cleanup complete")
                 
