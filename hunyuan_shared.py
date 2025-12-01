@@ -387,13 +387,30 @@ class HunyuanModelCache:
     _model_on_cpu = False  # Track if model is parked on CPU for fast reload
 
     @classmethod
+    def _normalize_path(cls, path: str) -> str:
+        """Normalize path for consistent comparison."""
+        import os
+        # Resolve to absolute, normalize slashes, remove trailing slashes
+        try:
+            return os.path.normpath(os.path.abspath(path)).lower()
+        except Exception:
+            return path.lower().rstrip('/\\')
+
+    @classmethod
     def get(cls, model_path: str):
-        if cls._cached_model is not None and cls._cached_path == model_path:
-            if cls._model_on_cpu:
-                logger.info("Found cached Hunyuan model on CPU for %s - will move to GPU", model_path)
+        if cls._cached_model is not None:
+            # Normalize both paths for comparison
+            requested = cls._normalize_path(model_path)
+            cached = cls._normalize_path(cls._cached_path) if cls._cached_path else ""
+            
+            if requested == cached:
+                if cls._model_on_cpu:
+                    logger.info("Found cached Hunyuan model on CPU for %s - will move to GPU", model_path)
+                else:
+                    logger.info("Using cached Hunyuan model for %s", model_path)
+                return cls._cached_model
             else:
-                logger.info("Using cached Hunyuan model for %s", model_path)
-            return cls._cached_model
+                logger.info("Cache path mismatch: requested=%s, cached=%s", requested, cached)
         return None
 
     @classmethod
@@ -407,6 +424,37 @@ class HunyuanModelCache:
         cls._cached_model = model
         cls._cached_path = model_path
         cls._model_on_cpu = False
+
+    @classmethod
+    def debug_status(cls) -> dict:
+        """Return current cache status for debugging."""
+        status = {
+            "has_model": cls._cached_model is not None,
+            "cached_path": cls._cached_path,
+            "on_cpu": cls._model_on_cpu,
+        }
+        if cls._cached_model is not None:
+            # Sample device placement
+            cuda_count = 0
+            cpu_count = 0
+            meta_count = 0
+            try:
+                for i, param in enumerate(cls._cached_model.parameters()):
+                    if i >= 50:
+                        break
+                    if param.device.type == 'cuda':
+                        cuda_count += 1
+                    elif param.device.type == 'cpu':
+                        cpu_count += 1
+                    elif param.device.type == 'meta':
+                        meta_count += 1
+                status["cuda_params"] = cuda_count
+                status["cpu_params"] = cpu_count
+                status["meta_params"] = meta_count
+            except Exception as e:
+                status["error"] = str(e)
+        logger.info(f"Cache status: {status}")
+        return status
 
     @classmethod
     def soft_unload(cls) -> bool:
@@ -615,7 +663,17 @@ class HunyuanModelCache:
     @classmethod
     def clear(cls) -> bool:
         import gc
+        import traceback
         had_model = cls._cached_model is not None
+        
+        # Log who is calling clear and the call stack
+        if had_model:
+            logger.info("=" * 40)
+            logger.info("HunyuanModelCache.clear() called!")
+            logger.info("Call stack (most recent call last):")
+            for line in traceback.format_stack()[-5:-1]:
+                logger.info(line.strip())
+            logger.info("=" * 40)
         
         if had_model:
             logger.info("Clearing cached Hunyuan model from VRAM...")
@@ -716,21 +774,35 @@ class HunyuanModelCache:
 
 
 class HunyuanImage3Unload:
-    """Utility node that clears cached Hunyuan models from GPU VRAM."""
+    """
+    Utility node that clears cached Hunyuan models from GPU VRAM.
+    
+    For successive runs with downstream models (Flux detailer, SAM2, etc.):
+    - Place this node AFTER Hunyuan generation but BEFORE downstream nodes
+    - Enable 'clear_for_downstream' to free Hunyuan VRAM for other models
+    - The unload_signal output can trigger downstream nodes after clearing
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "force_clear": ("BOOLEAN", {"default": True}),
+                "force_clear": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Clear the cached Hunyuan model from VRAM"
+                }),
             },
             "optional": {
+                "clear_for_downstream": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Aggressively clear VRAM for downstream models (Flux, SAM2, etc). Use for successive runs where Hunyuan needs to reload each time anyway."
+                }),
                 "trigger": ("*", {"default": None}),
             }
         }
 
-    RETURN_TYPES = ("BOOLEAN", "*")
-    RETURN_NAMES = ("cleared", "unload_signal")
+    RETURN_TYPES = ("BOOLEAN", "STRING", "*")
+    RETURN_NAMES = ("cleared", "vram_status", "unload_signal")
     FUNCTION = "unload"
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
@@ -740,14 +812,61 @@ class HunyuanImage3Unload:
         # Always re-run this node to ensure VRAM is cleared when requested
         return float("nan")
 
-    def unload(self, force_clear, trigger=None):
+    def unload(self, force_clear, clear_for_downstream=False, trigger=None):
+        import gc
+        import time
+        
         cleared = False
+        vram_status = ""
+        
+        # Get initial VRAM state
+        vram_before = 0
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_before = (total - free) / 1024**3
+            except Exception:
+                pass
+        
         if force_clear:
             cleared = HunyuanModelCache.clear()
         
+        # Additional aggressive clearing for downstream models
+        if clear_for_downstream:
+            logger.info("=" * 60)
+            logger.info("CLEARING VRAM FOR DOWNSTREAM MODELS")
+            logger.info("Freeing space for Flux detailer, SAM2, etc.")
+            logger.info("=" * 60)
+            
+            # Multiple GC passes
+            for _ in range(3):
+                gc.collect()
+            
+            # Clear CUDA cache aggressively
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                
+                # Try to release cached blocks
+                try:
+                    torch.cuda.memory._set_allocator_settings("")
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        
+        # Get final VRAM state
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_after = (total - free) / 1024**3
+                vram_freed = vram_before - vram_after
+                vram_status = f"{free/1024**3:.1f}GB free ({vram_freed:.1f}GB freed)"
+                logger.info(f"VRAM after unload: {vram_status}")
+            except Exception:
+                vram_status = "Could not query VRAM"
+        
         # Return a signal that changes to force downstream nodes to re-evaluate if needed
-        import time
-        return (cleared, float(time.time()))
+        return (cleared, vram_status, float(time.time()))
 
 
 class HunyuanImage3SoftUnload:
@@ -1097,6 +1216,146 @@ class HunyuanImage3ForceUnload:
         
         memory_report = "\n".join(report_lines)
         return (cleared or clear_comfy_cache, memory_report, float(time.time()))
+
+
+class HunyuanImage3ClearDownstream:
+    """
+    Clear downstream models (Flux, SAM2, Florence, etc.) while KEEPING Hunyuan loaded.
+    
+    Use this node at the END of your workflow (after all downstream processing)
+    to free VRAM from other models before the next Hunyuan generation.
+    
+    Workflow placement:
+    [Hunyuan] → [Generate] → [Flux Detailer] → [SAM2] → [Output] → [THIS NODE]
+                                                                        ↓
+                                                              (triggers on next run)
+    
+    This allows successive Hunyuan runs without reloading the large model each time,
+    while still freeing VRAM used by downstream models between runs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clear_comfy_models": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use ComfyUI's model management to unload non-Hunyuan models"
+                }),
+                "aggressive_gc": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Run aggressive garbage collection"
+                }),
+            },
+            "optional": {
+                "trigger": ("*", {
+                    "default": None,
+                    "tooltip": "Connect to final output to ensure this runs after downstream models"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "*")
+    RETURN_NAMES = ("memory_report", "signal")
+    FUNCTION = "clear_downstream"
+    CATEGORY = "HunyuanImage3"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def clear_downstream(self, clear_comfy_models=True, aggressive_gc=True, trigger=None):
+        import gc
+        import time
+        
+        report_lines = ["=== CLEARING DOWNSTREAM MODELS ==="]
+        report_lines.append("Keeping Hunyuan model loaded")
+        
+        # Get initial VRAM state
+        vram_before = 0
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_before = (total - free) / 1024**3
+                report_lines.append(f"VRAM before: {vram_before:.2f}GB used")
+            except Exception:
+                pass
+        
+        # Use ComfyUI's model management to unload models
+        if clear_comfy_models:
+            try:
+                import comfy.model_management as mm
+                
+                # Get current loaded models info before clearing
+                if hasattr(mm, 'current_loaded_models'):
+                    loaded = mm.current_loaded_models
+                    if loaded:
+                        report_lines.append(f"ComfyUI has {len(loaded)} models loaded")
+                
+                # Unload all models that ComfyUI is managing
+                # Note: This won't touch our Hunyuan cache since we manage it separately
+                if hasattr(mm, 'unload_all_models'):
+                    mm.unload_all_models()
+                    report_lines.append("Called ComfyUI unload_all_models()")
+                
+                # Soft empty cache to release memory
+                if hasattr(mm, 'soft_empty_cache'):
+                    mm.soft_empty_cache()
+                    report_lines.append("Called ComfyUI soft_empty_cache()")
+                
+                # Cleanup models - more aggressive
+                if hasattr(mm, 'cleanup_models'):
+                    mm.cleanup_models()
+                    report_lines.append("Called ComfyUI cleanup_models()")
+                    
+            except ImportError:
+                report_lines.append("ComfyUI model_management not available")
+            except Exception as e:
+                report_lines.append(f"ComfyUI cleanup error: {e}")
+        
+        # Aggressive garbage collection
+        if aggressive_gc:
+            for i in range(3):
+                collected = gc.collect()
+                if i == 0:
+                    report_lines.append(f"GC collected {collected} objects")
+        
+        # Clear CUDA cache (but NOT our Hunyuan model)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            report_lines.append("Cleared CUDA cache")
+        
+        # Verify Hunyuan is still cached
+        if HunyuanModelCache._cached_model is not None:
+            report_lines.append(f"✓ Hunyuan model still cached: {HunyuanModelCache._cached_path}")
+            if HunyuanModelCache._model_on_cpu:
+                report_lines.append("  (model is on CPU)")
+            else:
+                report_lines.append("  (model is on GPU)")
+        else:
+            report_lines.append("⚠ No Hunyuan model in cache")
+        
+        # Get final VRAM state
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_after = (total - free) / 1024**3
+                vram_freed = vram_before - vram_after
+                report_lines.append(f"VRAM after: {vram_after:.2f}GB used")
+                report_lines.append(f"VRAM freed: {vram_freed:.2f}GB")
+            except Exception:
+                pass
+        
+        report_lines.append("=== END CLEAR DOWNSTREAM ===")
+        
+        # Log the report
+        for line in report_lines:
+            logger.info(line)
+        
+        memory_report = "\n".join(report_lines)
+        return (memory_report, float(time.time()))
 
 
 class MemoryTracker:

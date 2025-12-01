@@ -177,9 +177,81 @@ Pair **Hunyuan 3 Loader (NF4 Low VRAM+)** with **Hunyuan 3 Generate (Low VRAM Bu
 | **Hunyuan 3 Generate (Low VRAM)** | Quantized-friendly large generation | Varies | Moderate |
 | **Hunyuan 3 Generate (Low VRAM Budget)** | Low VRAM mode with smart heuristics + telemetry | Varies | Moderate |
 | **Hunyuan 3 Unload** | Free VRAM | - | Instant |
+| **Hunyuan 3 Soft Unload (Fast)** | Move model to CPU (fast reload) | - | Instant |
+| **Hunyuan 3 Force Unload (Nuclear)** | Aggressive VRAM clearing | - | Instant |
+| **Hunyuan 3 Clear Downstream Models** | Clear other models, keep Hunyuan | - | Instant |
 | **Hunyuan 3 GPU Info** | Diagnostic/GPU detection | - | Instant |
 
 > 🆕 **Budget/Telemetry Nodes**: New loader/generator variants keep the legacy nodes untouched while exposing GPU budget sliders, smarter "smart" mode logic, and MemoryTracker telemetry in the node status. Mix and match them only if you need the extra controls; existing workflows can stay on the classic nodes.
+
+### 🧠 VRAM Management & Workflow Strategies
+
+Managing VRAM is critical when running Hunyuan3 alongside other models. Here are the recommended workflows:
+
+#### Scenario 1: Hunyuan Only (Simple)
+```
+[Loader] → [Generate] → [Save Image]
+```
+- Set `keep_model_loaded: True` for successive runs
+- Model stays cached, fast subsequent generations
+
+#### Scenario 2: Hunyuan with Downstream Models (Flux, SAM2, Florence)
+
+**Option A: Keep Hunyuan Loaded (Recommended for successive runs)**
+```
+[Hunyuan Loader] → [Generate] → [Flux Detailer] → [SAM2] → [Save] → [Clear Downstream Models]
+       ↑                                                                      ↓
+       └──────────────────────── next run ────────────────────────────────────┘
+```
+- Place **"Hunyuan 3 Clear Downstream Models"** at the END of workflow
+- Connect its `trigger` input to your final output
+- This clears Flux/SAM2/Florence VRAM while **keeping Hunyuan loaded**
+- Next run: Hunyuan is already loaded (fast!), downstream models reload (small)
+
+**Option B: Clear Everything Between Runs**
+```
+[Hunyuan Loader] → [Generate] → [Unload] → [Flux Detailer] → [SAM2] → [Save]
+                                   ↑
+                    enable "clear_for_downstream"
+```
+- Use standard **Unload** node with `clear_for_downstream: True`
+- Hunyuan unloads after generation, freeing VRAM for downstream
+- Hunyuan reloads from disk on next run (slower but simpler)
+
+#### Scenario 3: Cross-Tab VRAM Pollution
+
+When running workflows in multiple browser tabs, models from other tabs stay in VRAM but ComfyUI "forgets" about them.
+
+**Solution**: Use the BF16 Loader's `clear_vram_before_load` option:
+```
+[Hunyuan Loader (BF16)]  ← enable "clear_vram_before_load"
+         ↓
+    [Generate]
+```
+- Clears ALL orphaned VRAM before loading Hunyuan
+- Helps when VRAM is "mysteriously" full
+
+#### VRAM Management Node Summary
+
+| Node | When to Use |
+|------|-------------|
+| **Unload** | Clear Hunyuan model between runs |
+| **Clear Downstream Models** | Keep Hunyuan, clear Flux/SAM2/etc. |
+| **Force Unload (Nuclear)** | After OOM errors, stuck VRAM |
+| **Soft Unload** | BF16 only - park model in RAM for fast reload |
+
+#### BF16 Loader Target Resolution Options
+
+The BF16 loader has a `target_resolution` dropdown that reserves VRAM for inference:
+
+| Option | VRAM Reserved | Use When |
+|--------|---------------|----------|
+| **Auto (safe default)** | 35GB | Unknown resolution, auto-detection |
+| **1MP Fast (96GB+)** | 8GB | 96GB+ cards, max speed at 1MP |
+| **1MP (1024x1024)** | 15GB | Standard 1MP generation |
+| **2MP (1920x1080)** | 30GB | HD/2K generation |
+| **3MP (2048x1536)** | 55GB | Large images |
+| **4MP+ (2560x1920)** | 75GB | Very large images |
 
 ### INT8 Budget Workflow Controls
 

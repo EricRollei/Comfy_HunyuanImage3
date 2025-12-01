@@ -44,10 +44,21 @@ class HunyuanImage3FullLoader:
     """
     Loads FULL HunyuanImage-3.0 model in BF16 (no quantization).
     
-    Memory Reservation Guidelines (reserve_memory_gb):
-    - 1024x1024 (Standard): 6-8 GB
-    - 2048x2048 (2K): ~12 GB
-    - 4096x4096 (4K): ~30-40 GB
+    Uses HuggingFace device_map to automatically offload layers to CPU
+    based on target resolution. Select your expected max resolution to
+    ensure enough VRAM is reserved for inference.
+    
+    VRAM Requirements by Resolution:
+    - Auto (safe default): ~35GB reserved - works with Auto resolution in generation
+    - 1MP Fast (96GB+): ~8GB reserved - maximum speed, keeps most model on GPU
+    - 1MP (1024x1024): ~15GB reserved for inference
+    - 2MP (1920x1080): ~30GB reserved for inference
+    - 3MP (2048x1536): ~55GB reserved for inference (needs 96GB+ GPU)
+    - 4MP+ (2560x1920): ~75GB reserved (needs 192GB+ GPU or will OOM)
+    
+    NOTE: BF16 model is ~160GB total. With device_map offloading, only
+    part stays on GPU. The rest shuttles from CPU during inference,
+    which is SLOWER than INT8 but higher quality.
     """
     
     @classmethod
@@ -56,12 +67,13 @@ class HunyuanImage3FullLoader:
             "required": {
                 "model_name": (cls._get_available_models(),),
                 "force_reload": ("BOOLEAN", {"default": False}),
-                "reserve_memory_gb": ("FLOAT", {
-                    "default": 8.0, 
-                    "min": 2.0, 
-                    "max": 80.0, 
-                    "step": 0.5,
-                    "tooltip": "VRAM to leave free for generation. Recommended: 8GB (1K), 12GB (2K), 30GB+ (4K)."
+                "target_resolution": (["Auto (safe default)", "1MP Fast (96GB+)", "1MP (1024x1024)", "2MP (1920x1080)", "3MP (2048x1536)", "4MP+ (2560x1920)"], {
+                    "default": "Auto (safe default)",
+                    "tooltip": "Auto reserves 35GB for typical auto-resolution. 1MP Fast keeps more on GPU for speed."
+                }),
+                "clear_vram_before_load": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Clear ALL VRAM before loading (helps when other models pollute VRAM)"
                 }),
             },
             "optional": {
@@ -74,10 +86,11 @@ class HunyuanImage3FullLoader:
     CATEGORY = "HunyuanImage3"
 
     @classmethod
-    def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
+    def IS_CHANGED(cls, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        return model_name
+        # Reload if resolution changes (different memory reservation needed)
+        return f"{model_name}_{target_resolution}"
     
     @classmethod
     def _get_available_models(cls):
@@ -94,7 +107,49 @@ class HunyuanImage3FullLoader:
         
         return available if available else ["HunyuanImage-3"]
     
-    def load_model(self, model_name, force_reload=False, reserve_memory_gb=6.0, unload_signal=None):
+    def load_model(self, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None):
+        import gc
+        
+        # If requested, aggressively clear ALL VRAM before loading
+        # This helps when other workflows/tabs have polluted VRAM
+        if clear_vram_before_load:
+            logger.info("=" * 60)
+            logger.info("CLEARING ALL VRAM BEFORE LOADING")
+            logger.info("This helps when other models are polluting VRAM")
+            logger.info("=" * 60)
+            
+            # Clear our cache first
+            HunyuanModelCache.clear()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Clear ALL CUDA memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Try to release any cached memory from other models
+                # by running gc multiple times
+                for _ in range(3):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                
+                free, total = torch.cuda.mem_get_info(0)
+                logger.info(f"After VRAM clear: {free/1024**3:.1f}GB free of {total/1024**3:.1f}GB")
+        
+        # Calculate reserve based on target resolution using empirical formula: 12 * MP^1.4
+        resolution_to_reserve = {
+            "Auto (safe default)": 35.0, # Safe for auto-resolution (typically 2-2.5MP)
+            "1MP Fast (96GB+)": 8.0,     # Aggressive - keeps more on GPU for speed
+            "1MP (1024x1024)": 15.0,     # 12 * 1^1.4 * 1.25 safety margin
+            "2MP (1920x1080)": 30.0,     # 12 * 2^1.4 * 1.15 safety margin  
+            "3MP (2048x1536)": 55.0,     # 12 * 3^1.4 * 1.15 safety margin
+            "4MP+ (2560x1920)": 75.0,    # 12 * 4^1.4 * 1.15 safety margin
+        }
+        reserve_memory_gb = resolution_to_reserve.get(target_resolution, 30.0)
+        logger.info(f"Target resolution: {target_resolution} -> Reserving {reserve_memory_gb}GB for inference")
+        
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
         model_path = Path(folder_paths.models_dir) / model_name
@@ -107,30 +162,49 @@ class HunyuanImage3FullLoader:
             cached = None
         else:
             cached = HunyuanModelCache.get(model_path_str)
+            if cached is None:
+                # Debug: show why cache miss occurred
+                HunyuanModelCache.debug_status()
         
         if cached is not None:
             try:
                 # Validate cached model has valid device placement
-                has_valid_device = False
-                for param in cached.parameters():
-                    if param.device.type == 'cuda' and param.device.index is not None:
-                        has_valid_device = True
-                        break
-                    elif param.device.type == 'cpu':
-                        logger.info("Cached model is on CPU, clearing and reloading to GPU...")
-                        HunyuanModelCache.clear()
-                        cached = None
-                        break
+                # For device_map models, we may have cuda, cpu, AND meta tensors
+                has_cuda = False
+                has_cpu_only = False
+                sample_count = 0
                 
-                if not has_valid_device and cached is not None:
-                    logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
-                    HunyuanModelCache.clear()
-                    cached = None
-                elif cached is not None:
-                    logger.info("Using cached model from previous load")
+                for param in cached.parameters():
+                    sample_count += 1
+                    if sample_count > 100:  # Sample first 100 params
+                        break
+                    
+                    if param.device.type == 'cuda':
+                        has_cuda = True
+                        break  # Found CUDA param, model is valid
+                    elif param.device.type == 'meta':
+                        # Meta tensors are expected with device_map offloading
+                        # Keep checking for cuda params
+                        continue
+                    elif param.device.type == 'cpu':
+                        # Found CPU param but no CUDA yet
+                        has_cpu_only = True
+                
+                if has_cuda:
+                    logger.info("Using cached model from previous load (has CUDA tensors)")
                     self._apply_dtype_patches()
                     ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
                     return (cached,)
+                elif has_cpu_only:
+                    logger.info("Cached model has only CPU tensors, clearing and reloading to GPU...")
+                    HunyuanModelCache.clear()
+                    cached = None
+                else:
+                    # Only meta tensors found - this is broken
+                    logger.warning("Cached model has only meta tensors (broken state), clearing and reloading...")
+                    HunyuanModelCache.clear()
+                    cached = None
+                    
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
                 HunyuanModelCache.clear()
@@ -146,6 +220,18 @@ class HunyuanImage3FullLoader:
             max_memory = None
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info(0)
+                free_gb = free / 1024**3
+                total_gb = total / 1024**3
+                
+                # WARN if VRAM isn't mostly free - this will cause slow inference!
+                if free_gb < total_gb * 0.85:
+                    logger.warning("=" * 60)
+                    logger.warning(f"WARNING: Only {free_gb:.1f}GB of {total_gb:.1f}GB VRAM free!")
+                    logger.warning("Other models may be using VRAM. This will cause more")
+                    logger.warning("CPU offloading and SLOWER inference (20+ min vs 8 min).")
+                    logger.warning("Consider running Force Unload first or restarting ComfyUI.")
+                    logger.warning("=" * 60)
+                
                 # Reserve specified amount for generation overhead
                 reserve_bytes = int(reserve_memory_gb * 1024**3)
                 max_gpu_memory = free - reserve_bytes
@@ -157,6 +243,7 @@ class HunyuanImage3FullLoader:
                 
                 max_memory = {0: max_gpu_memory, "cpu": "100GiB"}
                 logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_memory_gb}GB)")
+                logger.info(f"VRAM status: {free_gb:.1f}GB free of {total_gb:.1f}GB total")
 
             load_kwargs = dict(
                 device_map="auto",

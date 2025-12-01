@@ -41,6 +41,7 @@ from .hunyuan_shared import (
     HunyuanImage3Unload,
     HunyuanImage3ForceUnload,
     HunyuanImage3SoftUnload,
+    HunyuanImage3ClearDownstream,
     HunyuanModelCache,
     MemoryTracker,
     ensure_model_on_device,
@@ -2682,6 +2683,7 @@ NODE_CLASS_MAPPINGS = {
     "HunyuanImage3Unload": HunyuanImage3Unload,
     "HunyuanImage3SoftUnload": HunyuanImage3SoftUnload,
     "HunyuanImage3ForceUnload": HunyuanImage3ForceUnload,
+    "HunyuanImage3ClearDownstream": HunyuanImage3ClearDownstream,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2698,4 +2700,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HunyuanImage3Unload": "Hunyuan 3 Unload",
     "HunyuanImage3SoftUnload": "Hunyuan 3 Soft Unload (Fast)",
     "HunyuanImage3ForceUnload": "Hunyuan 3 Force Unload (Nuclear)",
+    "HunyuanImage3ClearDownstream": "Hunyuan 3 Clear Downstream Models",
 }
