@@ -73,7 +73,7 @@ class HunyuanImage3FullLoader:
                 }),
                 "clear_vram_before_load": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Clear ALL VRAM before loading (helps when other models pollute VRAM)"
+                    "tooltip": "Clear OTHER models (Flux, SAM2, etc) from VRAM while keeping Hunyuan cached. Use for successive runs with downstream models."
                 }),
             },
             "optional": {
@@ -110,33 +110,48 @@ class HunyuanImage3FullLoader:
     def load_model(self, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None):
         import gc
         
-        # If requested, aggressively clear ALL VRAM before loading
-        # This helps when other workflows/tabs have polluted VRAM
+        # If requested, clear OTHER models from VRAM while PRESERVING our Hunyuan cache
+        # This is useful for successive runs where downstream models (Flux, SAM2) pollute VRAM
         if clear_vram_before_load:
             logger.info("=" * 60)
-            logger.info("CLEARING ALL VRAM BEFORE LOADING")
-            logger.info("This helps when other models are polluting VRAM")
+            logger.info("CLEARING OTHER MODELS FROM VRAM (keeping Hunyuan cached)")
             logger.info("=" * 60)
             
-            # Clear our cache first
-            HunyuanModelCache.clear()
+            # Use ComfyUI's model management to unload other models
+            # This does NOT affect our HunyuanModelCache
+            try:
+                import comfy.model_management as mm
+                
+                if hasattr(mm, 'unload_all_models'):
+                    mm.unload_all_models()
+                    logger.info("Cleared ComfyUI managed models")
+                if hasattr(mm, 'soft_empty_cache'):
+                    mm.soft_empty_cache()
+                if hasattr(mm, 'cleanup_models'):
+                    mm.cleanup_models()
+                    
+            except ImportError:
+                logger.warning("ComfyUI model_management not available")
+            except Exception as e:
+                logger.warning(f"Error clearing ComfyUI models: {e}")
             
             # Force garbage collection
-            gc.collect()
+            for _ in range(3):
+                gc.collect()
             
-            # Clear ALL CUDA memory
+            # Clear CUDA cache (but NOT our Hunyuan model which is in HunyuanModelCache)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 
-                # Try to release any cached memory from other models
-                # by running gc multiple times
-                for _ in range(3):
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                
                 free, total = torch.cuda.mem_get_info(0)
-                logger.info(f"After VRAM clear: {free/1024**3:.1f}GB free of {total/1024**3:.1f}GB")
+                logger.info(f"After clearing other models: {free/1024**3:.1f}GB free of {total/1024**3:.1f}GB")
+                
+            # Verify our cache is intact
+            if HunyuanModelCache._cached_model is not None:
+                logger.info(f"✓ Hunyuan model still cached: {HunyuanModelCache._cached_path}")
+            else:
+                logger.info("No Hunyuan model was cached (will load fresh)")
         
         # Calculate reserve based on target resolution using empirical formula: 12 * MP^1.4
         resolution_to_reserve = {
