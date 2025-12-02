@@ -256,7 +256,14 @@ class HunyuanImage3FullLoader:
                     logger.warning(f"Reserved memory ({reserve_memory_gb}GB) leaves too little for model. Using minimum 4GB.")
                     max_gpu_memory = 4 * 1024**3
                 
+                # IMPORTANT: Explicitly set other GPUs to 0 to prevent accelerate from using them
+                # This ensures the model only uses GPU 0 (Blackwell) + CPU offload
                 max_memory = {0: max_gpu_memory, "cpu": "100GiB"}
+                # Block all other GPUs
+                for i in range(1, torch.cuda.device_count()):
+                    max_memory[i] = 0
+                    logger.info(f"Blocking GPU {i} ({torch.cuda.get_device_name(i)}) from model loading")
+                
                 logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_memory_gb}GB)")
                 logger.info(f"VRAM status: {free_gb:.1f}GB free of {total_gb:.1f}GB total")
 
