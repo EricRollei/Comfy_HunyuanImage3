@@ -574,25 +574,31 @@ class HunyuanImage3Int8Loader:
                     HunyuanModelCache.clear()
                     cached = None
                 else:
-                    # Check if model has valid device placement
-                    has_valid_device = False
+                    # For NF4/device_map models, we may have BOTH cuda and cpu params
+                    # Just need to verify at least SOME params are on cuda
+                    has_cuda_device = False
+                    cuda_count = 0
+                    cpu_count = 0
                     try:
-                        # Check a model parameter to see if it has a valid device
-                        for param in cached.parameters():
-                            if param.device.type == 'cuda' and param.device.index is not None:
-                                has_valid_device = True
+                        for i, param in enumerate(cached.parameters()):
+                            if i >= 100:  # Sample first 100 params
                                 break
-                            elif param.device.type == 'cpu' or param.device.index is None:
-                                break
-                    except Exception:
-                        has_valid_device = False
+                            if param.device.type == 'cuda':
+                                has_cuda_device = True
+                                cuda_count += 1
+                            elif param.device.type == 'cpu':
+                                cpu_count += 1
+                        logger.info(f"Cache validation: {cuda_count} CUDA params, {cpu_count} CPU params (sampled 100)")
+                    except Exception as e:
+                        logger.warning(f"Error during cache validation: {e}")
+                        has_cuda_device = False
                     
-                    if not has_valid_device and cached is not None:
-                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                    if not has_cuda_device and cached is not None:
+                        logger.warning("Cached model has NO CUDA params, clearing cache and reloading...")
                         HunyuanModelCache.clear()
                         cached = None
                     elif cached is not None:
-                        logger.info("Using cached model from previous load")
+                        logger.info("✓ Using cached NF4 model (validated CUDA params present)")
                         self._apply_dtype_patches()
                         patch_hunyuan_generate_image(cached)
                         ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
@@ -874,23 +880,31 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
                     HunyuanModelCache.clear()
                     cached = None
                 else:
-                    has_valid_device = False
+                    # For NF4/device_map models, we may have BOTH cuda and cpu params
+                    # Just need to verify at least SOME params are on cuda
+                    has_cuda_device = False
+                    cuda_count = 0
+                    cpu_count = 0
                     try:
-                        for param in cached.parameters():
-                            if param.device.type == 'cuda' and param.device.index is not None:
-                                has_valid_device = True
+                        for i, param in enumerate(cached.parameters()):
+                            if i >= 100:  # Sample first 100 params
                                 break
-                            elif param.device.type == 'cpu' or param.device.index is None:
-                                break
-                    except Exception:
-                        has_valid_device = False
+                            if param.device.type == 'cuda':
+                                has_cuda_device = True
+                                cuda_count += 1
+                            elif param.device.type == 'cpu':
+                                cpu_count += 1
+                        logger.info(f"Cache validation: {cuda_count} CUDA params, {cpu_count} CPU params (sampled 100)")
+                    except Exception as e:
+                        logger.warning(f"Error during cache validation: {e}")
+                        has_cuda_device = False
 
-                    if not has_valid_device and cached is not None:
-                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                    if not has_cuda_device and cached is not None:
+                        logger.warning("Cached model has NO CUDA params, clearing cache and reloading...")
                         HunyuanModelCache.clear()
                         cached = None
                     elif cached is not None:
-                        logger.info("Using cached NF4 Low VRAM model")
+                        logger.info("✓ Using cached NF4 Low VRAM model (validated CUDA params present)")
                         self._apply_dtype_patches()
                         patch_hunyuan_generate_image(cached)
                         ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
@@ -1222,26 +1236,35 @@ class HunyuanImage3Int8LoaderBudget:
                             cached = None
                     else:
                         # Model should be on GPU, validate it
-                        has_valid_device = False
+                        # For INT8/device_map models, we may have BOTH cuda and cpu params
+                        # Just need to verify at least SOME params are on cuda
+                        has_cuda_device = False
+                        cuda_count = 0
+                        cpu_count = 0
                         try:
-                            for param in cached.parameters():
-                                if param.device.type == 'cuda' and param.device.index is not None:
-                                    has_valid_device = True
+                            for i, param in enumerate(cached.parameters()):
+                                if i >= 100:  # Sample first 100 params
                                     break
-                                elif param.device.type == 'cpu' or param.device.index is None:
-                                    break
-                        except Exception:
-                            has_valid_device = False
+                                if param.device.type == 'cuda':
+                                    has_cuda_device = True
+                                    cuda_count += 1
+                                elif param.device.type == 'cpu':
+                                    cpu_count += 1
+                            logger.info(f"Cache validation: {cuda_count} CUDA params, {cpu_count} CPU params (sampled 100)")
+                        except Exception as e:
+                            logger.warning(f"Error during cache validation: {e}")
+                            has_cuda_device = False
                         
-                        if not has_valid_device and cached is not None:
-                            logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                        if not has_cuda_device and cached is not None:
+                            logger.warning("Cached model has NO CUDA params, clearing cache and reloading...")
                             HunyuanModelCache.clear()
                             cached = None
                         elif cached is not None:
-                            logger.info("Using cached INT8 model from GPU")
+                            logger.info("✓ Using cached INT8 model (validated CUDA params present)")
                             self._apply_dtype_patches()
                             patch_hunyuan_generate_image(cached)
                             ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
                             return (cached,)
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
@@ -1468,22 +1491,24 @@ class HunyuanImage3Generate:
         # Validate model has valid device placement before generation
         if not skip_device_check:
             try:
-                has_valid_device = False
-                for param in model.parameters():
-                    if param.device.type == 'cuda' and param.device.index is not None:
-                        has_valid_device = True
+                # For device_map models, we may have BOTH cuda and cpu params
+                # Just need to verify at least SOME params are on cuda
+                has_cuda_device = False
+                for i, param in enumerate(model.parameters()):
+                    if i >= 100:  # Sample first 100 params
                         break
-                    elif param.device.type == 'cpu' or param.device.index is None:
+                    if param.device.type == 'cuda':
+                        has_cuda_device = True
                         break
                 
-                if not has_valid_device:
+                if not has_cuda_device:
                     raise RuntimeError(
-                        "Model has invalid device placement (likely cleared by Unload node). "
+                        "Model has no CUDA params (likely cleared by Unload node). "
                         "Please ensure the model loader runs before generation in your workflow. "
                         "The model may have been unloaded by a previous Unload node."
                     )
             except Exception as e:
-                if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
+                if "no cuda params" in str(e).lower() or "cleared by unload" in str(e).lower():
                     raise
                 logger.warning(f"Could not validate model device: {e}")
         
@@ -2042,22 +2067,24 @@ class HunyuanImage3GenerateLarge:
 
         # Validate model has valid device placement before generation
         try:
-            has_valid_device = False
-            for param in model.parameters():
-                if param.device.type == 'cuda' and param.device.index is not None:
-                    has_valid_device = True
+            # For device_map models, we may have BOTH cuda and cpu params
+            # Just need to verify at least SOME params are on cuda
+            has_cuda_device = False
+            for i, param in enumerate(model.parameters()):
+                if i >= 100:  # Sample first 100 params
                     break
-                elif param.device.type == 'cpu' or param.device.index is None:
+                if param.device.type == 'cuda':
+                    has_cuda_device = True
                     break
             
-            if not has_valid_device:
+            if not has_cuda_device:
                 raise RuntimeError(
-                    "Model has invalid device placement (likely cleared by Unload node). "
+                    "Model has no CUDA params (likely cleared by Unload node). "
                     "Please ensure the model loader runs before generation in your workflow. "
                     "The model may have been unloaded by a previous Unload node."
                 )
         except Exception as e:
-            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
+            if "no cuda params" in str(e).lower() or "cleared by unload" in str(e).lower():
                 raise
             logger.warning(f"Could not validate model device: {e}")
         
@@ -2398,22 +2425,24 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
                 offload_mode = "smart"
 
         try:
-            has_valid_device = False
-            for param in model.parameters():
-                if param.device.type == 'cuda' and param.device.index is not None:
-                    has_valid_device = True
+            # For device_map models, we may have BOTH cuda and cpu params
+            # Just need to verify at least SOME params are on cuda
+            has_cuda_device = False
+            for i, param in enumerate(model.parameters()):
+                if i >= 100:  # Sample first 100 params
                     break
-                elif param.device.type == 'cpu' or param.device.index is None:
+                if param.device.type == 'cuda':
+                    has_cuda_device = True
                     break
 
-            if not has_valid_device:
+            if not has_cuda_device:
                 raise RuntimeError(
-                    "Model has invalid device placement (likely cleared by Unload node). "
+                    "Model has no CUDA params (likely cleared by Unload node). "
                     "Please ensure the model loader runs before generation in your workflow. "
                     "The model may have been unloaded by a previous Unload node."
                 )
         except Exception as e:
-            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
+            if "no cuda params" in str(e).lower() or "cleared by unload" in str(e).lower():
                 raise
             logger.warning(f"Could not validate model device: {e}")
 
