@@ -491,17 +491,33 @@ python hunyuan_quantize_nf4.py \
 
 ## 📊 Performance Benchmarks
 
-**RTX 6000 Ada (48GB) - NF4 Quantized:**
+### RTX 6000 Pro Blackwell (96GB) - INT8 Quantized ⭐ RECOMMENDED
+
+**Configuration**: INT8 Loader + Large Generate (Budget) with `offload_mode=disabled`
+
+| Resolution | Steps | Time | Speed | VRAM |
+|------------|-------|------|-------|------|
+| 1152x864 (~1MP) | 40 | **2:35** | 3.9s/step | 85GB → 95GB |
+
+This is the **fastest configuration** for high-VRAM cards. Key settings:
+- Use **INT8 Loader (Budget)** with ~80GB GPU target
+- Use **Large Generate (Budget)** with `offload_mode=disabled`
+- Keep model loaded between runs for successive generations
+
+### RTX 6000 Ada (48GB) - NF4 Quantized
+
 - Load time: ~35 seconds
 - 1024x1024 @ 50 steps: ~4 seconds/step
 - VRAM usage: ~45GB
 
-**2x RTX 4090 (48GB each) - Multi-GPU BF16:**
+### 2x RTX 4090 (48GB each) - Multi-GPU BF16
+
 - Load time: ~60 seconds
 - 1024x1024 @ 50 steps: ~3.5 seconds/step
 - VRAM usage: ~70GB + 10GB distributed
 
-**RTX 6000 Blackwell (96GB) - Full BF16:**
+### RTX 6000 Blackwell (96GB) - Full BF16
+
 - Load time: ~25 seconds
 - 1024x1024 @ 50 steps: ~3 seconds/step
 - VRAM usage: ~80GB
