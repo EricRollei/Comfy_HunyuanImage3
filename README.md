@@ -184,6 +184,23 @@ Pair **Hunyuan 3 Loader (NF4 Low VRAM+)** with **Hunyuan 3 Generate (Low VRAM Bu
 
 > 🆕 **Budget/Telemetry Nodes**: New loader/generator variants keep the legacy nodes untouched while exposing GPU budget sliders, smarter "smart" mode logic, and MemoryTracker telemetry in the node status. Mix and match them only if you need the extra controls; existing workflows can stay on the classic nodes.
 
+### 🎯 Choosing the Right Generate Node
+
+| Node | Has offload_mode? | Best For |
+|------|-------------------|----------|
+| **Hunyuan 3 Generate** | No | Standard use, ≤2MP, plenty of VRAM (48GB+). Fastest option. |
+| **Hunyuan 3 Generate (Telemetry)** | No | Same as above + RAM/VRAM stats in status output |
+| **Hunyuan 3 Generate (Large/Offload)** | Yes | Large images (>2MP) that need CPU offload during inference |
+| **Hunyuan 3 Generate (Large Budget)** | Yes | Large images + GPU budget control + telemetry |
+| **Hunyuan 3 Generate (Low VRAM)** | Yes | Quantized models (INT8/NF4) on limited VRAM (24-48GB) |
+| **Hunyuan 3 Generate (Low VRAM Budget)** | Yes | Quantized + GPU budget control + telemetry |
+
+**Quick Guide:**
+- **96GB GPU + NF4/INT8**: Use **"Hunyuan 3 Generate"** (fastest, no offload overhead)
+- **24-48GB GPU + NF4**: Use **"Hunyuan 3 Generate (Low VRAM)"** or **"Low VRAM Budget"**
+- **Large images (>2MP)**: Use **"Large/Offload"** or **"Large Budget"** variants
+- **Want telemetry?**: Use the **"Budget"** variants for memory stats in output
+
 ### 🧠 VRAM Management & Workflow Strategies
 
 Managing VRAM is critical when running Hunyuan3 alongside other models. Here are the recommended workflows:
