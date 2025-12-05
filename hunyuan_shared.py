@@ -420,10 +420,14 @@ class HunyuanModelCache:
 
     @classmethod
     def store(cls, model_path: str, model) -> None:
-        logger.info("Caching Hunyuan model for reuse: %s", model_path)
+        # Normalize path for consistent cache key
+        normalized_path = os.path.normpath(os.path.abspath(model_path))
+        logger.info("Caching Hunyuan model for reuse: %s", normalized_path)
+        logger.info(f"  Model type: {type(model).__name__}, id: {id(model)}")
         cls._cached_model = model
-        cls._cached_path = model_path
+        cls._cached_path = normalized_path
         cls._model_on_cpu = False
+        logger.info(f"  Cache now has model: {cls._cached_model is not None}")
 
     @classmethod
     def debug_status(cls) -> dict:
@@ -941,6 +945,10 @@ class HunyuanImage3SoftUnload:
 
     def execute(self, action="soft_unload", trigger=None):
         import time
+        
+        # Debug: Log cache status at start
+        cache_status = HunyuanModelCache.debug_status()
+        logger.info(f"SoftUnload [{action}]: Cache status = {cache_status}")
         
         if action == "soft_unload":
             # Check for unsupported model types BEFORE attempting soft unload
