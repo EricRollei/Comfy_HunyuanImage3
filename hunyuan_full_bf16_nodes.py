@@ -183,42 +183,56 @@ class HunyuanImage3FullLoader:
         
         if cached is not None:
             try:
-                # Validate cached model has valid device placement
-                # For device_map models, we may have cuda, cpu, AND meta tensors
-                has_cuda = False
-                has_cpu_only = False
-                sample_count = 0
-                
-                for param in cached.parameters():
-                    sample_count += 1
-                    if sample_count > 100:  # Sample first 100 params
-                        break
-                    
-                    if param.device.type == 'cuda':
-                        has_cuda = True
-                        break  # Found CUDA param, model is valid
-                    elif param.device.type == 'meta':
-                        # Meta tensors are expected with device_map offloading
-                        # Keep checking for cuda params
-                        continue
-                    elif param.device.type == 'cpu':
-                        # Found CPU param but no CUDA yet
-                        has_cpu_only = True
-                
-                if has_cuda:
-                    logger.info("Using cached model from previous load (has CUDA tensors)")
-                    self._apply_dtype_patches()
-                    ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
-                    return (cached,)
-                elif has_cpu_only:
-                    logger.info("Cached model has only CPU tensors, clearing and reloading to GPU...")
-                    HunyuanModelCache.clear()
-                    cached = None
+                # Check if model is soft-unloaded to CPU (fast restore path)
+                if HunyuanModelCache.is_on_cpu():
+                    logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                    if HunyuanModelCache.restore_to_gpu():
+                        logger.info("✓ Model restored from CPU to GPU")
+                        self._apply_dtype_patches()
+                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                        return (cached,)
+                    else:
+                        # Restore failed, need to reload from disk
+                        logger.warning("Failed to restore model from CPU, reloading from disk...")
+                        HunyuanModelCache.clear()
+                        cached = None
                 else:
-                    # Only meta tensors found - this is broken
-                    logger.warning("Cached model has only meta tensors (broken state), clearing and reloading...")
-                    HunyuanModelCache.clear()
-                    cached = None
+                    # Validate cached model has valid device placement
+                    # For device_map models, we may have cuda, cpu, AND meta tensors
+                    has_cuda = False
+                    has_cpu_only = False
+                    sample_count = 0
+                    
+                    for param in cached.parameters():
+                        sample_count += 1
+                        if sample_count > 100:  # Sample first 100 params
+                            break
+                        
+                        if param.device.type == 'cuda':
+                            has_cuda = True
+                            break  # Found CUDA param, model is valid
+                        elif param.device.type == 'meta':
+                            # Meta tensors are expected with device_map offloading
+                            # Keep checking for cuda params
+                            continue
+                        elif param.device.type == 'cpu':
+                            # Found CPU param but no CUDA yet - not tracked by is_on_cpu
+                            has_cpu_only = True
+                    
+                    if has_cuda:
+                        logger.info("Using cached model from previous load (has CUDA tensors)")
+                        self._apply_dtype_patches()
+                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                        return (cached,)
+                    elif has_cpu_only:
+                        logger.warning("Cached model on CPU but not tracked as soft-unloaded, clearing...")
+                        HunyuanModelCache.clear()
+                        cached = None
+                    else:
+                        # Only meta tensors found - this is broken
+                        logger.warning("Cached model has only meta tensors (broken state), clearing and reloading...")
+                        HunyuanModelCache.clear()
+                        cached = None
                     
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
@@ -383,22 +397,34 @@ class HunyuanImage3FullGPULoader:
         cached = HunyuanModelCache.get(model_path_str)
         if cached is not None:
             self._apply_dtype_patches()
-            # Check if cached model is on the requested device
-            is_on_device = False
-            for param in cached.parameters():
-                if param.device.type == 'cuda' and param.device.index == device_index:
-                    is_on_device = True
-                    break
-                # Just check first param
-                break
             
-            if is_on_device:
-                logger.info(f"Using cached model (already on cuda:{device_index})")
-                return (cached,)
+            # Check if model is soft-unloaded to CPU (fast restore path)
+            if HunyuanModelCache.is_on_cpu():
+                logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                if HunyuanModelCache.restore_to_gpu(target_device):
+                    logger.info("✓ Model restored from CPU to GPU")
+                    return (cached,)
+                else:
+                    logger.warning("Failed to restore model from CPU, reloading from disk...")
+                    HunyuanModelCache.clear()
+                    cached = None
             else:
-                logger.info(f"Cached model is on different device, moving to cuda:{device_index}...")
-                ensure_model_on_device(cached, target_device, skip_quantized_params=False)
-                return (cached,)
+                # Check if cached model is on the requested device
+                is_on_device = False
+                for param in cached.parameters():
+                    if param.device.type == 'cuda' and param.device.index == device_index:
+                        is_on_device = True
+                        break
+                    # Just check first param
+                    break
+                
+                if is_on_device:
+                    logger.info(f"Using cached model (already on cuda:{device_index})")
+                    return (cached,)
+                else:
+                    logger.info(f"Cached model is on different device, moving to cuda:{device_index}...")
+                    ensure_model_on_device(cached, target_device, skip_quantized_params=False)
+                    return (cached,)
 
         logger.info(f"Loading FULL BF16 model on {target_device}: {model_name}")
         if target_device.type != "cuda":
@@ -584,10 +610,22 @@ class HunyuanImage3DualGPULoader:
 
         cached = HunyuanModelCache.get(model_path_str)
         if cached is not None:
-            logger.info("Using cached model (already loaded)")
             self._apply_dtype_patches()
-            # Don't re-enforce device placement for multi-GPU - model already distributed
-            return (cached,)
+            
+            # Check if model is soft-unloaded to CPU (fast restore path)
+            if HunyuanModelCache.is_on_cpu():
+                logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                if HunyuanModelCache.restore_to_gpu():
+                    logger.info("✓ Model restored from CPU to GPU")
+                    return (cached,)
+                else:
+                    logger.warning("Failed to restore model from CPU, reloading from disk...")
+                    HunyuanModelCache.clear()
+                    cached = None
+            else:
+                logger.info("Using cached model (already loaded)")
+                # Don't re-enforce device placement for multi-GPU - model already distributed
+                return (cached,)
 
         if not torch.cuda.is_available():
             raise RuntimeError("Multi-GPU loader requires CUDA GPUs")
@@ -891,11 +929,24 @@ class HunyuanImage3SingleGPU88GB:
 
         cached = HunyuanModelCache.get(model_path_str)
         if cached is not None:
-            logger.info("Using cached model")
-            patch_dynamic_cache_dtype()
-            patch_hunyuan_generate_image(cached)
-            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
-            return (cached,)
+            # Check if model is soft-unloaded to CPU (fast restore path)
+            if HunyuanModelCache.is_on_cpu():
+                logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                if HunyuanModelCache.restore_to_gpu():
+                    logger.info("✓ Model restored from CPU to GPU")
+                    patch_dynamic_cache_dtype()
+                    patch_hunyuan_generate_image(cached)
+                    return (cached,)
+                else:
+                    logger.warning("Failed to restore model from CPU, reloading from disk...")
+                    HunyuanModelCache.clear()
+                    cached = None
+            else:
+                logger.info("Using cached model")
+                patch_dynamic_cache_dtype()
+                patch_hunyuan_generate_image(cached)
+                ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                return (cached,)
 
         if not torch.cuda.is_available():
             raise RuntimeError("This loader requires CUDA")

@@ -300,34 +300,48 @@ class HunyuanImage3QuantizedLoader:
                     HunyuanModelCache.clear()
                     cached = None
                 else:
-                    # Check if model has valid device placement
-                    # After unload, models may have None device indices which cause errors
-                    has_valid_device = False
-                    try:
-                        # Check a model parameter to see if it has a valid device
-                        for param in cached.parameters():
-                            if param.device.type == 'cuda' and param.device.index is not None:
-                                has_valid_device = True
-                                break
-                            elif param.device.type == 'cpu':
-                                # Model was moved to CPU, needs to be reloaded to GPU
-                                logger.info("Cached model is on CPU, clearing and reloading to GPU...")
-                                HunyuanModelCache.clear()
-                                cached = None
-                                break
-                    except Exception:
+                    # Check if model is soft-unloaded to CPU (fast restore path)
+                    if HunyuanModelCache.is_on_cpu():
+                        logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                        if HunyuanModelCache.restore_to_gpu():
+                            logger.info("✓ Model restored from CPU to GPU")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
+                        else:
+                            # Restore failed, need to reload from disk
+                            logger.warning("Failed to restore model from CPU, reloading from disk...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                    else:
+                        # Model should be on GPU - validate device placement
                         has_valid_device = False
-                    
-                    if not has_valid_device and cached is not None:
-                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
-                        HunyuanModelCache.clear()
-                        cached = None
-                    elif cached is not None:
-                        logger.info("Using cached model from previous load")
-                        self._apply_dtype_patches()
-                        patch_hunyuan_generate_image(cached)
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
-                        return (cached,)
+                        try:
+                            # Check a model parameter to see if it has a valid device
+                            for param in cached.parameters():
+                                if param.device.type == 'cuda' and param.device.index is not None:
+                                    has_valid_device = True
+                                    break
+                                elif param.device.type == 'cpu':
+                                    # Model on CPU but not tracked as soft-unloaded - inconsistent state
+                                    logger.warning("Cached model on CPU but not tracked as soft-unloaded, clearing...")
+                                    HunyuanModelCache.clear()
+                                    cached = None
+                                    break
+                        except Exception:
+                            has_valid_device = False
+                        
+                        if not has_valid_device and cached is not None:
+                            logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                        elif cached is not None:
+                            logger.info("Using cached model from previous load")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
                 HunyuanModelCache.clear()
@@ -566,35 +580,49 @@ class HunyuanImage3Int8Loader:
                     HunyuanModelCache.clear()
                     cached = None
                 else:
-                    # For NF4/device_map models, we may have BOTH cuda and cpu params
-                    # Just need to verify at least SOME params are on cuda
-                    has_cuda_device = False
-                    cuda_count = 0
-                    cpu_count = 0
-                    try:
-                        for i, param in enumerate(cached.parameters()):
-                            if i >= 100:  # Sample first 100 params
-                                break
-                            if param.device.type == 'cuda':
-                                has_cuda_device = True
-                                cuda_count += 1
-                            elif param.device.type == 'cpu':
-                                cpu_count += 1
-                        logger.info(f"Cache validation: {cuda_count} CUDA params, {cpu_count} CPU params (sampled 100)")
-                    except Exception as e:
-                        logger.warning(f"Error during cache validation: {e}")
+                    # Check if model is soft-unloaded to CPU (fast restore path)
+                    if HunyuanModelCache.is_on_cpu():
+                        logger.info("Cached model is on CPU, restoring to GPU (fast path)...")
+                        if HunyuanModelCache.restore_to_gpu():
+                            logger.info("✓ Model restored from CPU to GPU")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
+                        else:
+                            # Restore failed, need to reload from disk
+                            logger.warning("Failed to restore model from CPU, reloading from disk...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                    else:
+                        # Model should be on GPU - validate device placement
                         has_cuda_device = False
-                    
-                    if not has_cuda_device and cached is not None:
-                        logger.warning("Cached model has NO CUDA params, clearing cache and reloading...")
-                        HunyuanModelCache.clear()
-                        cached = None
-                    elif cached is not None:
-                        logger.info("✓ Using cached NF4 model (validated CUDA params present)")
-                        self._apply_dtype_patches()
-                        patch_hunyuan_generate_image(cached)
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
-                        return (cached,)
+                        cuda_count = 0
+                        cpu_count = 0
+                        try:
+                            for i, param in enumerate(cached.parameters()):
+                                if i >= 100:  # Sample first 100 params
+                                    break
+                                if param.device.type == 'cuda':
+                                    has_cuda_device = True
+                                    cuda_count += 1
+                                elif param.device.type == 'cpu':
+                                    cpu_count += 1
+                            logger.info(f"Cache validation: {cuda_count} CUDA params, {cpu_count} CPU params (sampled 100)")
+                        except Exception as e:
+                            logger.warning(f"Error during cache validation: {e}")
+                            has_cuda_device = False
+                        
+                        if not has_cuda_device and cached is not None:
+                            logger.warning("Cached model has NO CUDA params, clearing cache and reloading...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                        elif cached is not None:
+                            logger.info("✓ Using cached INT8 model (validated CUDA params present)")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
                 HunyuanModelCache.clear()
