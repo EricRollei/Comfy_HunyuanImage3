@@ -22,6 +22,7 @@ PARTICULAR PURPOSE AND NONINFRINGEMENT.
 Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 """
 
+# Core working nodes - always loaded
 from .hunyuan_quantized_nodes import NODE_CLASS_MAPPINGS as QUANTIZED_MAPPINGS
 from .hunyuan_quantized_nodes import NODE_DISPLAY_NAME_MAPPINGS as QUANTIZED_DISPLAY_MAPPINGS
 
@@ -31,17 +32,59 @@ from .hunyuan_full_bf16_nodes import NODE_DISPLAY_NAME_MAPPINGS as FULL_DISPLAY_
 from .hunyuan_api_nodes import NODE_CLASS_MAPPINGS as API_MAPPINGS
 from .hunyuan_api_nodes import NODE_DISPLAY_NAME_MAPPINGS as API_DISPLAY_MAPPINGS
 
+# V2 unified node and Instruct nodes - load conditionally
+UNIFIED_V2_MAPPINGS = {}
+UNIFIED_V2_DISPLAY_MAPPINGS = {}
+INSTRUCT_MAPPINGS = {}
+INSTRUCT_DISPLAY_MAPPINGS = {}
+HIGHRES_MAPPINGS = {}
+HIGHRES_DISPLAY_MAPPINGS = {}
+MOE_TEST_MAPPINGS = {}
+MOE_TEST_DISPLAY_MAPPINGS = {}
+
+try:
+    from .hunyuan_unified_v2 import NODE_CLASS_MAPPINGS as UNIFIED_V2_MAPPINGS
+    from .hunyuan_unified_v2 import NODE_DISPLAY_NAME_MAPPINGS as UNIFIED_V2_DISPLAY_MAPPINGS
+except Exception as e:
+    print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_unified_v2: {e}")
+
+try:
+    from .hunyuan_instruct_nodes import NODE_CLASS_MAPPINGS as INSTRUCT_MAPPINGS
+    from .hunyuan_instruct_nodes import NODE_DISPLAY_NAME_MAPPINGS as INSTRUCT_DISPLAY_MAPPINGS
+except Exception as e:
+    print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_instruct_nodes: {e}")
+
+try:
+    from .hunyuan_highres_nodes import NODE_CLASS_MAPPINGS as HIGHRES_MAPPINGS
+    from .hunyuan_highres_nodes import NODE_DISPLAY_NAME_MAPPINGS as HIGHRES_DISPLAY_MAPPINGS
+except Exception as e:
+    print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_highres_nodes: {e}")
+
+try:
+    from .hunyuan_moe_test_node import NODE_CLASS_MAPPINGS as MOE_TEST_MAPPINGS
+    from .hunyuan_moe_test_node import NODE_DISPLAY_NAME_MAPPINGS as MOE_TEST_DISPLAY_MAPPINGS
+except Exception as e:
+    print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_moe_test_node: {e}")
+
 # Combine all mappings
 NODE_CLASS_MAPPINGS = {
     **QUANTIZED_MAPPINGS,
     **FULL_MAPPINGS,
     **API_MAPPINGS,
+    **UNIFIED_V2_MAPPINGS,
+    **INSTRUCT_MAPPINGS,
+    **HIGHRES_MAPPINGS,
+    **MOE_TEST_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     **QUANTIZED_DISPLAY_MAPPINGS,
     **FULL_DISPLAY_MAPPINGS,
     **API_DISPLAY_MAPPINGS,
+    **UNIFIED_V2_DISPLAY_MAPPINGS,
+    **INSTRUCT_DISPLAY_MAPPINGS,
+    **HIGHRES_DISPLAY_MAPPINGS,
+    **MOE_TEST_DISPLAY_MAPPINGS,
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

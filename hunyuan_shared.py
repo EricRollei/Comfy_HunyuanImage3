@@ -24,12 +24,175 @@ Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 
 import logging
 import os
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 import psutil
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ComfyUI folder_paths integration
+# ---------------------------------------------------------------------------
+try:
+    import folder_paths as _folder_paths
+    _COMFYUI_FOLDER_PATHS = True
+except ImportError:
+    _folder_paths = None
+    _COMFYUI_FOLDER_PATHS = False
+
+HUNYUAN_FOLDER_NAME = "hunyuan"
+"""folder_paths category used by all base-model loaders."""
+
+HUNYUAN_INSTRUCT_FOLDER_NAME = "hunyuan_instruct"
+"""folder_paths category used by Instruct-model loaders."""
+
+
+def _register_hunyuan_model_paths() -> None:
+    """Register ``hunyuan`` and ``hunyuan_instruct`` as ComfyUI model folders.
+
+    Both default to ``ComfyUI/models/`` so that models placed there are found
+    automatically.  Users can add extra search paths through
+    ``extra_model_paths.yaml``::
+
+        comfyui:
+            hunyuan: |
+                models/
+                H:/MyModels/
+            hunyuan_instruct: |
+                models/
+                H:/MyModels/
+    """
+    if not _COMFYUI_FOLDER_PATHS:
+        return
+    try:
+        _folder_paths.add_model_folder_path(
+            HUNYUAN_FOLDER_NAME, _folder_paths.models_dir, is_default=True
+        )
+        _folder_paths.add_model_folder_path(
+            HUNYUAN_INSTRUCT_FOLDER_NAME, _folder_paths.models_dir, is_default=True
+        )
+    except Exception as exc:
+        logger.warning("Could not register Hunyuan model folders: %s", exc)
+
+
+_register_hunyuan_model_paths()
+
+
+def get_hunyuan_search_paths(category: str = HUNYUAN_FOLDER_NAME) -> List[str]:
+    """Return the list of directories registered for *category*.
+
+    Falls back to ``folder_paths.models_dir`` when the category has not been
+    registered (or ComfyUI is not available).
+    """
+    if not _COMFYUI_FOLDER_PATHS:
+        return []
+    try:
+        return list(_folder_paths.get_folder_paths(category))
+    except Exception:
+        return [_folder_paths.models_dir]
+
+
+def resolve_hunyuan_model_path(
+    model_name: str,
+    category: str = HUNYUAN_FOLDER_NAME,
+) -> str:
+    """Resolve a display name (or bare folder name) to an absolute path.
+
+    Search order:
+    1. Exact match in the ``_path_map`` stashed by the scanner that built the
+       dropdown list (handles the ``"Name [location]"`` display names).
+    2. Walk every directory registered under *category* looking for a matching
+       subfolder.
+    3. Treat *model_name* as an absolute path if it already exists on disk.
+    4. Return *model_name* unchanged and let the caller error.
+    """
+    # 1. Scanner path map (populated by get_available_hunyuan_models)
+    path_map = getattr(get_available_hunyuan_models, "_path_map", {})
+    if model_name in path_map:
+        return path_map[model_name]
+
+    # 2. Walk registered search dirs
+    for search_dir in get_hunyuan_search_paths(category):
+        candidate = os.path.join(search_dir, model_name)
+        if os.path.isdir(candidate):
+            return candidate
+
+    # 3. Already an absolute path?
+    if os.path.isdir(model_name):
+        return model_name
+
+    # 4. Last resort
+    return model_name
+
+
+def get_available_hunyuan_models(
+    category: str = HUNYUAN_FOLDER_NAME,
+    *,
+    name_filter=None,
+    require_file: Optional[str] = None,
+    sort_key=None,
+    fallback: Optional[List[str]] = None,
+) -> List[str]:
+    """Scan registered model directories and return display names.
+
+    Parameters
+    ----------
+    category:
+        The ``folder_paths`` category to scan (``"hunyuan"`` or
+        ``"hunyuan_instruct"``).
+    name_filter:
+        Optional callable ``(folder_name: str) -> bool``.  Only directories
+        for which this returns ``True`` are included.
+    require_file:
+        If given, only directories containing a file with this name are
+        included (e.g. ``"quantization_metadata.json"``).
+    sort_key:
+        Optional key function passed to ``list.sort()``.
+    fallback:
+        Returned when no matching directories are found.
+    """
+    found: dict[str, str] = {}  # display_name -> full_path
+    models_dir_norm = ""
+    if _COMFYUI_FOLDER_PATHS:
+        models_dir_norm = os.path.normpath(_folder_paths.models_dir)
+
+    for base_path in get_hunyuan_search_paths(category):
+        if not os.path.isdir(base_path):
+            continue
+        try:
+            for item in os.listdir(base_path):
+                item_path = os.path.join(base_path, item)
+                if not os.path.isdir(item_path):
+                    continue
+
+                # Apply name filter
+                if name_filter and not name_filter(item):
+                    continue
+
+                # Apply file-existence filter
+                if require_file and not os.path.isfile(
+                    os.path.join(item_path, require_file)
+                ):
+                    continue
+
+                # Build display name
+                if os.path.normpath(base_path) == models_dir_norm:
+                    display = item
+                else:
+                    display = f"{item} [{os.path.basename(base_path)}]"
+
+                if display not in found:
+                    found[display] = item_path
+        except Exception as exc:
+            logger.warning("Error scanning %s: %s", base_path, exc)
+
+    # Stash for resolve_hunyuan_model_path()
+    get_available_hunyuan_models._path_map = found
+
+    result = sorted(found.keys(), key=sort_key) if sort_key else sorted(found.keys())
+    return result if result else (fallback or [])
 
 _SDPA_PATCHED = False
 _ORIGINAL_SDPA = None
@@ -46,6 +209,135 @@ _ORIGINAL_INDEX_COPY_INPLACE = None
 _DYNAMIC_CACHE_PATCHED = False
 _ORIGINAL_DYNAMIC_CACHE_UPDATE = None
 _DTYPE_HOOKS_INSTALLED = False
+_MOE_EFFICIENT_PATCHED = False
+_MOE_ORIGINAL_FORWARDS = {}  # module id -> original forward
+
+
+def _efficient_moe_forward(self, hidden_states):
+    """
+    Memory-efficient MoE forward that avoids the giant dispatch_mask.
+    
+    The default 'eager' MoE implementation materializes a dispatch_mask of shape
+    [N_tokens, num_experts, expert_capacity] which is O(N² * topk / experts).
+    At 3MP with CFG (batch=2, ~25K tokens), this requires 10-37GB just for
+    the dispatch_mask and related einsum intermediates.
+    
+    This efficient version uses a simple loop-based approach:
+    1. Use easy_topk to get top-k expert indices and weights (tiny: [N, topk])
+    2. For each expert, gather its assigned tokens and run the expert MLP
+    3. Scatter-add the weighted outputs back
+    
+    Memory: O(N * hidden_size) instead of O(N * experts * capacity)
+    Speed: Similar — same expert MLPs run on same data, just dispatched differently.
+    """
+    torch.cuda.set_device(hidden_states.device.index)
+    bsz, seq_len, hidden_size = hidden_states.shape
+
+    # Shared MLP (if used)
+    if self.config.use_mixed_mlp_moe:
+        hidden_states_mlp = self.shared_mlp(hidden_states)
+
+    reshaped_input = hidden_states.reshape(-1, hidden_size)  # [N, hidden_size]
+    N = reshaped_input.shape[0]
+
+    # Get top-k expert assignments using the lightweight path
+    topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
+    # topk_weight: [N, topk] float32, topk_index: [N, topk] int64
+
+    # Prepare output buffer
+    combined_output = torch.zeros_like(reshaped_input)  # [N, hidden_size]
+
+    # Process each expert: gather assigned tokens, run MLP, scatter-add back
+    for expert_idx in range(self.num_experts):
+        # Find which (token, topk_slot) pairs route to this expert
+        # expert_mask: [N, topk] bool
+        expert_mask = (topk_index == expert_idx)
+
+        if not expert_mask.any():
+            continue
+
+        # Get token indices that route to this expert (any topk slot)
+        # token_mask: [N] bool — True if any topk slot routes to this expert
+        token_mask = expert_mask.any(dim=1)
+        token_indices = token_mask.nonzero(as_tuple=True)[0]
+
+        if token_indices.numel() == 0:
+            continue
+
+        # Gather the input tokens assigned to this expert
+        expert_input = reshaped_input[token_indices]  # [n_tokens, hidden_size]
+
+        # Run the expert MLP
+        # Expert MLPs expect 3D input [batch, seq, hidden] (they use .chunk(2, dim=2))
+        # so we unsqueeze to [1, n_tokens, hidden] and squeeze back after
+        expert_output = self.experts[expert_idx](expert_input.unsqueeze(0)).squeeze(0)  # [n_tokens, hidden_size]
+
+        # Compute combined weight for this expert across all topk slots
+        # For each selected token, sum the weights from all slots that chose this expert
+        expert_weights_for_tokens = (topk_weight[token_indices] * expert_mask[token_indices].float()).sum(dim=1)
+        # expert_weights_for_tokens: [n_tokens]
+
+        # Weighted scatter-add back to combined output
+        combined_output[token_indices] += expert_output * expert_weights_for_tokens.unsqueeze(1).to(expert_output.dtype)
+
+    combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
+
+    if self.config.use_mixed_mlp_moe:
+        output = hidden_states_mlp + combined_output
+    else:
+        output = combined_output
+
+    return output
+
+
+def patch_moe_efficient_forward(model) -> None:
+    """
+    Monkey-patch all HunyuanMoE modules to use memory-efficient forward.
+    
+    This replaces the dispatch_mask-based MoE routing with a loop-based approach
+    that uses ~75x less VRAM at high resolutions (3MP+).
+    
+    Safe to call multiple times (idempotent). Can be reverted with unpatch_moe_efficient_forward.
+    """
+    global _MOE_EFFICIENT_PATCHED, _MOE_ORIGINAL_FORWARDS
+    
+    patched_count = 0
+    for name, module in model.named_modules():
+        # Match by class name since we can't import the class directly without side effects
+        if type(module).__name__ == 'HunyuanMoE':
+            module_id = id(module)
+            if module_id not in _MOE_ORIGINAL_FORWARDS:
+                _MOE_ORIGINAL_FORWARDS[module_id] = module.forward
+            # Bind the efficient forward as a bound method
+            import types
+            module.forward = types.MethodType(_efficient_moe_forward, module)
+            patched_count += 1
+    
+    if patched_count > 0:
+        _MOE_EFFICIENT_PATCHED = True
+        logger.info(f"Patched {patched_count} HunyuanMoE layers with memory-efficient forward")
+    else:
+        logger.warning("No HunyuanMoE layers found to patch")
+
+
+def unpatch_moe_efficient_forward(model) -> None:
+    """Restore original MoE forward methods."""
+    global _MOE_EFFICIENT_PATCHED, _MOE_ORIGINAL_FORWARDS
+    
+    restored_count = 0
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'HunyuanMoE':
+            module_id = id(module)
+            if module_id in _MOE_ORIGINAL_FORWARDS:
+                module.forward = _MOE_ORIGINAL_FORWARDS[module_id]
+                del _MOE_ORIGINAL_FORWARDS[module_id]
+                restored_count += 1
+    
+    if restored_count > 0:
+        logger.info(f"Restored {restored_count} HunyuanMoE layers to original forward")
+    
+    if not _MOE_ORIGINAL_FORWARDS:
+        _MOE_EFFICIENT_PATCHED = False
 
 
 def install_dtype_harmonization_hooks(model) -> None:
@@ -89,7 +381,7 @@ def patch_scaled_dot_product_attention() -> None:
         return
     _ORIGINAL_SDPA = torch.nn.functional.scaled_dot_product_attention
 
-    def _patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    def _patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
         if isinstance(attn_mask, torch.Tensor) and attn_mask.device != query.device:
             attn_mask = attn_mask.to(device=query.device)
         return _ORIGINAL_SDPA(
@@ -100,6 +392,7 @@ def patch_scaled_dot_product_attention() -> None:
             dropout_p=dropout_p,
             is_causal=is_causal,
             scale=scale,
+        **kwargs,
         )
 
     torch.nn.functional.scaled_dot_product_attention = _patched_sdpa  # type: ignore[assignment]
@@ -217,6 +510,89 @@ def patch_index_copy_dtype() -> None:
     torch.Tensor.index_copy_ = _patched_index_copy_  # type: ignore[assignment]
     _INDEX_COPY_PATCHED = True
     logger.info("Patched Tensor.index_copy[ _] to align source dtype with destination")
+
+
+# =============================================================================
+# Patch: Fix upstream to_device() to handle dict inputs
+# =============================================================================
+# The upstream instruct model's to_device() helper (used in generate_image)
+# only handles Tensor and list types. When cond_vit_image_kwargs (a dict
+# containing attention_mask tensors) is passed through to_device(), the dict
+# falls through to the else branch and is returned unchanged, leaving
+# attention_mask tensors on CPU while the model runs on CUDA.
+# This causes: "Expected all tensors to be on the same device, but found
+# at least two devices, cuda:0 and cpu!" in the SigLIP2 vision encoder.
+
+_TO_DEVICE_PATCHED = False
+
+def patch_to_device_for_instruct(model) -> bool:
+    """
+    Patch the upstream to_device() function in the instruct model's module
+    to handle dict inputs recursively.
+    
+    The upstream to_device() only handles Tensor and list, but
+    cond_vit_image_kwargs is a dict containing tensors. Without this patch,
+    the dict passes through unchanged and attention_mask stays on CPU.
+    
+    Args:
+        model: The loaded instruct model (AutoModelForCausalLM)
+        
+    Returns:
+        True if patched successfully, False otherwise
+    """
+    global _TO_DEVICE_PATCHED
+    
+    # Find the module that contains to_device
+    # It's defined in the model's modeling_hunyuan_image_3.py
+    model_module = type(model).__module__
+    
+    try:
+        import sys
+        mod = sys.modules.get(model_module)
+        if mod is None:
+            # Try the parent module
+            parent_module = '.'.join(model_module.split('.')[:-1])
+            mod = sys.modules.get(parent_module)
+        
+        if mod is None:
+            logger.warning(f"Could not find module {model_module} for to_device patch")
+            return False
+        
+        original_to_device = getattr(mod, 'to_device', None)
+        if original_to_device is None:
+            logger.warning("to_device function not found in model module")
+            return False
+        
+        # Check if already patched (has dict handling)
+        import inspect
+        source = inspect.getsource(original_to_device)
+        if 'isinstance(data, dict)' in source:
+            logger.info("to_device already handles dicts, skipping patch")
+            return True
+        
+        # Create fixed version
+        def fixed_to_device(data, device):
+            """Fixed to_device that handles dict, Tensor, list, and tuple."""
+            if device is None:
+                return data
+            if isinstance(data, torch.Tensor):
+                return data.to(device)
+            elif isinstance(data, dict):
+                return {k: fixed_to_device(v, device) for k, v in data.items()}
+            elif isinstance(data, (list, tuple)):
+                return type(data)(fixed_to_device(x, device) for x in data)
+            else:
+                return data
+        
+        # Apply patch
+        mod.to_device = fixed_to_device
+        _TO_DEVICE_PATCHED = True
+        logger.info("Patched to_device() to handle dict inputs (fixes vision encoder device mismatch)")
+        return True
+        
+    except Exception as e:
+        logger.warning(f"Failed to patch to_device: {e}")
+        return False
 
 
 def patch_dynamic_cache_dtype() -> None:
@@ -1679,3 +2055,188 @@ def patch_hunyuan_generate_image(model):
             
             pipeline_class.__call__ = new_pipeline_call
             pipeline_class._is_patched_for_comfy = True
+
+
+def clear_generation_cache(model) -> None:
+    """
+    Clear KV cache and intermediate state after generation to free VRAM.
+
+    This addresses the issue where subsequent generations use more VRAM than the first,
+    because transformers keeps the KV cache (past_key_values) between calls.
+
+    Call this after each generation to ensure consistent VRAM usage.
+    """
+    import gc
+
+    cleared_items = []
+
+    # Clear past_key_values / KV cache
+    if hasattr(model, 'past_key_values'):
+        model.past_key_values = None
+        cleared_items.append("past_key_values")
+
+    # Clear any cached hidden states
+    if hasattr(model, '_cache'):
+        model._cache = None
+        cleared_items.append("_cache")
+
+    # Clear model's internal cache if it has one
+    if hasattr(model, 'model'):
+        inner_model = model.model
+        if hasattr(inner_model, '_cache'):
+            inner_model._cache = None
+            cleared_items.append("model._cache")
+        if hasattr(inner_model, 'past_key_values'):
+            inner_model.past_key_values = None
+            cleared_items.append("model.past_key_values")
+
+    # Clear any generation_config cache
+    if hasattr(model, 'generation_config') and hasattr(model.generation_config, '_cache'):
+        model.generation_config._cache = None
+        cleared_items.append("generation_config._cache")
+
+    # For transformer-based models, clear any layer-wise caches
+    for name, module in model.named_modules():
+        # Clear attention caches
+        if hasattr(module, 'key_value_cache'):
+            module.key_value_cache = None
+            cleared_items.append(f"{name}.key_value_cache")
+        if hasattr(module, '_past_key_value'):
+            module._past_key_value = None
+            cleared_items.append(f"{name}._past_key_value")
+
+    # Force garbage collection
+    gc.collect()
+
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        # Log memory state
+        free, total = torch.cuda.mem_get_info(0)
+        logger.info(
+            f"Post-generation cleanup: Cleared {len(cleared_items)} cache items. "
+            f"VRAM: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free"
+        )
+        if cleared_items:
+            logger.debug(
+                f"  Cleared: {', '.join(cleared_items[:5])}"
+                f"{'...' if len(cleared_items) > 5 else ''}"
+            )
+    else:
+        if cleared_items:
+            logger.info(f"Cleared {len(cleared_items)} cache items")
+
+
+def patch_pipeline_pre_vae_cleanup(model, enabled: bool = True):
+    """
+    Patch the VAE decode method to clear KV cache BEFORE decoding.
+
+    This addresses the issue where INT8/quantized models run out of memory during
+    VAE decode because the transformer's KV cache is still consuming VRAM.
+
+    The patch wraps the VAE's decode method to:
+    1. Clear KV cache, gc collect, empty CUDA cache
+    2. Then proceed with VAE decode
+
+    Args:
+        model: The HunyuanImage3 model
+        enabled: Whether to enable the patch
+    """
+    if not enabled:
+        return
+
+    # Try to get pipeline, but some models don't have one
+    pipeline = getattr(model, 'pipeline', None)
+
+    # Find the VAE - some models have it directly on model, others on pipeline
+    vae = None
+    if pipeline is not None:
+        vae = getattr(pipeline, 'vae', None)
+    if vae is None:
+        vae = getattr(model, 'vae', None)
+
+    if vae is None:
+        logger.warning("No VAE found on model or pipeline, cannot patch pre-VAE cleanup")
+        return
+
+    # Check if already patched - use VAE itself as marker
+    if getattr(vae, '_prevae_cleanup_patched', False):
+        logger.info("✓ VAE already patched for pre-decode cleanup")
+        return
+
+    # Store original decode
+    original_decode = vae.decode
+
+    def decode_with_cleanup(*args, **kwargs):
+        """Wrapper that clears KV cache before VAE decode to free VRAM.
+
+        The transformer's KV cache can consume 1-4 GB depending on resolution.
+        Clearing it before VAE decode ensures enough VRAM for the decode step.
+
+        IMPORTANT: We do NOT move the VAE between devices. Moving modules
+        with .to(cpu)/.to(cuda) breaks accelerate's dispatch hooks that were
+        set up by device_map='auto' during model loading, causing 'tensors on
+        different devices' errors on subsequent runs.
+        """
+        import gc
+
+        logger.info("PRE-VAE DECODE: Clearing KV cache before decode")
+
+        # Clear transformer caches to free VRAM for decode
+        clear_generation_cache(model)
+
+        # Garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+            free, total = torch.cuda.mem_get_info(0)
+            logger.info(f"  VRAM after cleanup: {free/1024**3:.1f}GB free / {total/1024**3:.1f}GB total")
+
+        # Enable VAE tiling if VRAM is critically low
+        if torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info(0)
+            free_gb = free / 1024**3
+
+            if free_gb < 15.0:
+                logger.warning(f"  Low VRAM ({free_gb:.1f}GB) - enabling VAE tiling for decode")
+                if hasattr(vae, 'enable_tiling'):
+                    vae.enable_tiling()
+
+        # Call original decode — VAE stays on its original device
+        result = original_decode(*args, **kwargs)
+
+        return result
+
+    # Replace decode method
+    vae.decode = decode_with_cleanup
+    vae._prevae_cleanup_patched = True
+    vae._original_decode = original_decode
+
+    logger.info("✓ Patched VAE decode: will clear KV cache before decode to free VRAM")
+
+
+def unpatch_pipeline_pre_vae_cleanup(model):
+    """Remove the pre-VAE cleanup patch and restore original decode method."""
+    # Find the VAE
+    pipeline = getattr(model, 'pipeline', None)
+    vae = None
+    if pipeline is not None:
+        vae = getattr(pipeline, 'vae', None)
+    if vae is None:
+        vae = getattr(model, 'vae', None)
+
+    if vae is None:
+        return
+
+    if not getattr(vae, '_prevae_cleanup_patched', False):
+        return
+
+    if hasattr(vae, '_original_decode'):
+        vae.decode = vae._original_decode
+        del vae._original_decode
+
+    vae._prevae_cleanup_patched = False
+    logger.info("Removed pre-VAE cleanup patch")

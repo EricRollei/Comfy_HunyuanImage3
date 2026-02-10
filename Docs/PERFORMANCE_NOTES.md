@@ -1,4 +1,4 @@
-# Hunyuan Image 3.0 Performance Notes
+ # Hunyuan Image 3.0 Performance Notes
 
 This document captures performance findings, optimization attempts, and library limitations discovered during development of this ComfyUI node set.
 
@@ -41,7 +41,24 @@ Empirical formula: `VRAM_inference ≈ 12 × (megapixels)^1.4`
 
 ## Key Findings
 
-### 1. INT8 is Optimal for 96GB GPUs
+### 1. INT8 Pre-Quantized Checkpoint Limitation (CPU Offloading)
+
+**Pre-quantized INT8 checkpoints CANNOT use CPU offloading via `device_map`.**
+
+This is a fundamental limitation of the bitsandbytes/transformers INT8 loading path:
+
+1. When transformers sees a CPU entry in `device_map`, it adds that module to `modules_to_not_convert`
+2. The module stays as regular `nn.Linear` (not converted to `Linear8bitLt`)
+3. Loading pre-quantized int8 weights into `nn.Linear` via `load_state_dict(assign=True)` fails because `nn.Parameter(int8_tensor)` tries to set `requires_grad=True`, but **integer tensors cannot require gradients**
+
+**This ONLY affects pre-quantized INT8 checkpoints** (weights stored as int8 on disk with SCB column-wise absmax scales). Models that **quantize at load time** (float16/bf16 checkpoint + `load_in_8bit=True`) do NOT hit this issue because CPU-mapped layers stay in fp16/fp32 and only GPU-mapped layers get quantized to int8 on-the-fly.
+
+**Workarounds:**
+- Load entirely to GPU (`device_map="cuda:0"`) — works if GPU has enough VRAM
+- Use `blocks_to_swap` parameter to load to CPU first, then manually move components to GPU (bypasses the device_map entirely)
+- Use NF4 quantization instead (smaller, fits easily on single GPU)
+
+### 2. INT8 is Optimal for 96GB GPUs
 
 With 96GB VRAM, INT8 quantization provides the best balance:
 - Model fits entirely in VRAM (81GB)
@@ -49,7 +66,7 @@ With 96GB VRAM, INT8 quantization provides the best balance:
 - Full GPU utilization
 - 3-minute inference vs 11+ minutes with BF16 offloading
 
-### 2. BF16 + Smart Offload is PCIe-Bound
+### 3. BF16 + Smart Offload is PCIe-Bound
 
 When using `accelerate`'s device_map offloading with BF16:
 - ~64GB of weights must shuttle between CPU and GPU
@@ -57,12 +74,23 @@ When using `accelerate`'s device_map offloading with BF16:
 - GPU utilization drops significantly (waiting for data)
 - Results in 3.8x slower inference than INT8
 
-### 3. Quality Differences
+### 4. Quality Differences
 
 Trained eyes can notice subtle differences between INT8 and BF16:
 - BF16 preserves full model precision
 - INT8 has minor quantization artifacts
 - For critical/production work, BF16 may be preferred despite time cost
+
+### 5. Steps and Flow Shift Tuning (Feb 2026)
+
+**Steps:** 40 steps produces quality very close to 50 steps across all model types
+(Instruct, Instruct-Distil, and base text-to-image). Default changed from 50 to 40.
+Distil models still default to 8 steps.
+
+**Flow shift:** Text-to-image generation produces slightly better fine detail at
+slightly lower flow_shift values than the model default of 3.0. Default changed to 2.8.
+The relationship is roughly linear — if the default was 2.5, then 2.15 would be better.
+Lower values = more fine detail, higher values = smoother/simpler output.
 
 ## Optimization Attempts
 

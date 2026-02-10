@@ -38,6 +38,7 @@ from accelerate import init_empty_weights, infer_auto_device_map
 from comfy.utils import ProgressBar
 
 from .hunyuan_shared import (
+    HUNYUAN_FOLDER_NAME,
     HunyuanImage3Unload,
     HunyuanImage3ForceUnload,
     HunyuanImage3SoftUnload,
@@ -46,8 +47,11 @@ from .hunyuan_shared import (
     MemoryTracker,
     ensure_model_on_device,
     format_memory_stats,
+    get_available_hunyuan_models,
+    get_hunyuan_search_paths,
     patch_dynamic_cache_dtype,
     patch_hunyuan_generate_image,
+    resolve_hunyuan_model_path,
 )
 from .hunyuan_api_config import get_api_config
 
@@ -149,18 +153,36 @@ def _estimate_inference_vram_gb(megapixels: float) -> float:
     """
     Estimate VRAM required for inference based on resolution.
     
-    Based on real-world measurements:
-    - 1MP: ~12GB
-    - 2MP: ~22GB  
-    - 3MP: ~45GB
+    Based on real-world measurements and MoE memory analysis:
+    - 1MP: ~12GB (attention + KV cache + small MoE intermediates)
+    - 2MP: ~25GB (MoE dispatch_mask starts growing significantly)
+    - 3MP: ~65GB (MoE dispatch_mask with CFG doubles tokens: 25K tokens,
+                   dispatch_mask [25K, 64, 3136] = 10GB bf16, plus combine_weights
+                   and einsum intermediates = ~30-37GB peak per layer)
     
-    This follows roughly exponential growth due to attention's O(n²) complexity.
-    Formula: 12 * MP^1.5 (approximately)
+    The MoE "eager" implementation materializes a dispatch_mask of shape
+    [N_tokens, num_experts, expert_capacity] which grows as O(N² * topk / experts).
+    With CFG (guidance_scale > 1), batch=2 doubles N.
     """
-    # Use empirical formula based on measurements
-    # 1MP -> 12GB, 2MP -> ~22GB, 3MP -> ~42GB (close to measured 45GB)
+    # Below 2MP, the original estimate works well
+    if megapixels <= 2.0:
+        base_vram = 12.0
+        return base_vram * (megapixels ** 1.4)
+    
+    # Above 2MP, MoE dispatch_mask dominates memory
+    # Empirical: 3MP with CFG needs ~65GB free (model weights 30GB + 65GB = 95GB total)
+    # Formula: accounts for quadratic growth of MoE intermediates
     base_vram = 12.0
-    return base_vram * (megapixels ** 1.4)
+    attention_vram = base_vram * (megapixels ** 1.4)
+    
+    # MoE dispatch_mask memory (dominant at high res):
+    # N_tokens ≈ 2 * (MP * 1e6 / 256) for CFG batch=2, VAE downsample 16x16
+    # dispatch_mask bf16: N * 64 * (8*N/64) * 2 bytes = N² * 16 bytes  
+    # Plus combine_weights, einsum intermediates: ~3x dispatch_mask
+    n_tokens = 2 * megapixels * 1_000_000 / 256  # CFG doubles batch
+    moe_dispatch_gb = (n_tokens ** 2 * 16 * 3) / (1024 ** 3)
+    
+    return max(attention_vram, moe_dispatch_gb)
 
 
 @lru_cache(maxsize=1)
@@ -172,14 +194,19 @@ def _resolution_metadata():
     align = 1
     presets = None
 
-    models_dir = Path(folder_paths.models_dir)
     candidate_dirs = []
-    default_dir = models_dir / "HunyuanImage-3"
+    default_path = resolve_hunyuan_model_path("HunyuanImage-3")
+    default_dir = Path(default_path)
     if default_dir.exists():
         candidate_dirs.append(default_dir)
-    for item in models_dir.iterdir():
-        if item.is_dir() and item not in candidate_dirs:
-            candidate_dirs.append(item)
+    # Also scan registered search paths so externally-stored models are found
+    for search_root in get_hunyuan_search_paths():
+        search_root_path = Path(search_root)
+        if not search_root_path.is_dir():
+            continue
+        for item in search_root_path.iterdir():
+            if item.is_dir() and item not in candidate_dirs:
+                candidate_dirs.append(item)
 
     for directory in candidate_dirs:
         config_path = directory / "config.json"
@@ -261,27 +288,17 @@ class HunyuanImage3QuantizedLoader:
     
     @classmethod
     def _get_available_models(cls):
-        models_dir = folder_paths.models_dir
-        hunyuan_dir = Path(models_dir)
-        available = []
-        
-        for item in hunyuan_dir.iterdir():
-            if not item.is_dir():
-                continue
-            meta_path = item / "quantization_metadata.json"
-            if not meta_path.exists():
-                continue
-            available.append(item.name)
-        
-        # Sort to prioritize NF4 models for this loader
-        available.sort(key=lambda x: 0 if "nf4" in x.lower() else 1)
-        
-        return available if available else ["HunyuanImage-3-NF4"]
+        available = get_available_hunyuan_models(
+            require_file="quantization_metadata.json",
+            sort_key=lambda x: 0 if "nf4" in x.lower() else 1,
+            fallback=["HunyuanImage-3-NF4"],
+        )
+        return available
     
     def load_model(self, model_name, force_reload=False, unload_signal=None, reserve_memory_gb=6.0):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         # If force_reload is True, skip cache and reload fresh
@@ -543,25 +560,19 @@ class HunyuanImage3Int8Loader:
     
     @classmethod
     def _get_available_models(cls):
-        models_dir = folder_paths.models_dir
-        hunyuan_dir = Path(models_dir)
-        available = []
-        
-        for item in hunyuan_dir.iterdir():
-            if item.is_dir() and (item / "quantization_metadata.json").exists():
-                available.append(item.name)
-        
-        # Sort to prioritize INT8 models for this loader
-        available.sort(key=lambda x: 0 if "int8" in x.lower() else 1)
-        
-        return available if available else ["HunyuanImage-3-INT8"]
+        available = get_available_hunyuan_models(
+            require_file="quantization_metadata.json",
+            sort_key=lambda x: 0 if "int8" in x.lower() else 1,
+            fallback=["HunyuanImage-3-INT8"],
+        )
+        return available
     
     def load_model(self, model_name, force_reload=False, unload_signal=None, reserve_memory_gb=6.0):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
         # reserve_memory_gb: kept for API compatibility but not used (INT8 needs all available memory)
         
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         # If force_reload is True, skip cache and reload fresh
@@ -639,7 +650,7 @@ class HunyuanImage3Int8Loader:
             logger.info(f"VRAM before load: {(total-free)/1024**3:.2f}GB used / {total/1024**3:.2f}GB total ({free/1024**3:.2f}GB free)")
         
         # Check metadata to warn about potential mismatch
-        meta_path = Path(folder_paths.models_dir) / model_name / "quantization_metadata.json"
+        meta_path = model_path / "quantization_metadata.json"
         if meta_path.exists():
             try:
                 with open(meta_path, 'r') as f:
@@ -870,20 +881,16 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
 
     @classmethod
     def _get_available_models(cls):
-        models_dir = folder_paths.models_dir
-        hunyuan_dir = Path(models_dir)
-        available = []
-
-        for item in hunyuan_dir.iterdir():
-            if item.is_dir() and (item / "quantization_metadata.json").exists():
-                available.append(item.name)
-
-        available.sort(key=lambda x: 0 if "nf4" in x.lower() else 1)
-        return available if available else ["HunyuanImage-3-NF4"]
+        available = get_available_hunyuan_models(
+            require_file="quantization_metadata.json",
+            sort_key=lambda x: 0 if "nf4" in x.lower() else 1,
+            fallback=["HunyuanImage-3-NF4"],
+        )
+        return available
 
     def load_model(self, model_name, force_reload=False, unload_signal=None,
                   reserve_memory_gb=6.0, gpu_memory_target_gb=18.0):
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         if force_reload:
@@ -1207,20 +1214,16 @@ class HunyuanImage3Int8LoaderBudget:
 
     @classmethod
     def _get_available_models(cls):
-        models_dir = folder_paths.models_dir
-        hunyuan_dir = Path(models_dir)
-        available = []
-
-        for item in hunyuan_dir.iterdir():
-            if item.is_dir() and (item / "quantization_metadata.json").exists():
-                available.append(item.name)
-
-        available.sort(key=lambda x: 0 if "int8" in x.lower() else 1)
-        return available if available else ["HunyuanImage-3-INT8"]
+        available = get_available_hunyuan_models(
+            require_file="quantization_metadata.json",
+            sort_key=lambda x: 0 if "int8" in x.lower() else 1,
+            fallback=["HunyuanImage-3-INT8"],
+        )
+        return available
 
     def load_model(self, model_name, force_reload=False, unload_signal=None,
                   reserve_memory_gb=20.0, gpu_memory_target_gb=80.0):
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         # If force_reload is True, skip cache and reload fresh
@@ -1307,7 +1310,7 @@ class HunyuanImage3Int8LoaderBudget:
 
         logger.info(f"Loading {model_name} (INT8 Budget)")
 
-        meta_path = Path(folder_paths.models_dir) / model_name / "quantization_metadata.json"
+        meta_path = model_path / "quantization_metadata.json"
         if meta_path.exists():
             try:
                 with open(meta_path, 'r') as f:
@@ -2001,7 +2004,7 @@ class HunyuanImage3GenerateLarge:
                 "model": ("HUNYUAN_MODEL",),
                 "prompt": ("STRING", {"multiline": True, "default": "A beautiful landscape"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
+                "steps": ("INT", {"default": 40, "min": 1, "max": 100}),
                 "resolution": (cls._get_large_resolutions(),),
                 "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.1}),
                 "offload_mode": (["smart", "always", "disabled"], {"default": "smart"}),
@@ -2170,41 +2173,38 @@ class HunyuanImage3GenerateLarge:
         
         # Temporarily enable CPU offload for this generation if requested
         if should_offload:
-            try:
-                from accelerate import cpu_offload as accelerate_cpu_offload
-                logger.info("Enabling CPU offload for large image generation...")
-                
-                # FORCE MOVE TO CPU FIRST
-                # This ensures VRAM is actually freed before we start offloading hooks
-                # If the model is currently on GPU (from FullLoader), this is critical.
-                logger.info("Moving model to CPU to ensure VRAM is free...")
-                
-                # Check for meta tensors first to avoid crash
-                has_meta = False
-                for param in model.parameters():
-                    if param.device.type == 'meta':
-                        has_meta = True
-                        break
-                
-                if has_meta:
-                    logger.info("Model has meta tensors (managed by accelerate), skipping manual .cpu() move.")
-                else:
-                    model.cpu()
+            # Check if this is a device_map model — those already have accelerate
+            # hooks managing device placement. Adding cpu_offload on top breaks them.
+            has_device_map = hasattr(model, 'hf_device_map') and model.hf_device_map is not None
+            has_meta = any(p.device.type == 'meta' for i, p in zip(range(50), model.parameters()))
+            is_device_map_model = has_device_map or has_meta
+            
+            if is_device_map_model:
+                logger.info("Model was loaded with device_map — accelerate hooks already manage offloading.")
+                logger.info("Skipping manual CPU offload to avoid 'Cannot copy out of meta tensor' errors.")
+            else:
+                try:
+                    from accelerate import cpu_offload as accelerate_cpu_offload
+                    logger.info("Enabling CPU offload for large image generation...")
                     
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    free, total = torch.cuda.mem_get_info(0)
-                    logger.info(f"GPU memory before clearing: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+                    # FORCE MOVE TO CPU FIRST
+                    # This ensures VRAM is actually freed before we start offloading hooks
+                    logger.info("Moving model to CPU to ensure VRAM is free...")
+                    model.cpu()
+                        
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        free, total = torch.cuda.mem_get_info(0)
+                        logger.info(f"GPU memory before clearing: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
 
-                # Apply cpu_offload
-                # This moves the model to CPU (redundant but safe) and adds hooks to move layers to GPU during forward
-                accelerate_cpu_offload(model, execution_device="cuda:0")
-                logger.info("✓ CPU offload enabled via accelerate")
-                
-            except ImportError:
-                logger.warning("accelerate library not found, cannot enable CPU offload")
-            except Exception as e:
-                logger.warning(f"Could not configure CPU offload: {e}")
+                    # Apply cpu_offload
+                    accelerate_cpu_offload(model, execution_device="cuda:0")
+                    logger.info("✓ CPU offload enabled via accelerate")
+                    
+                except ImportError:
+                    logger.warning("accelerate library not found, cannot enable CPU offload")
+                except Exception as e:
+                    logger.warning(f"Could not configure CPU offload: {e}")
         
         # Patch ResolutionGroup to allow arbitrary resolutions
         # The model's image_processor snaps to the nearest bucket by default.
@@ -2299,8 +2299,8 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
         })
 
         inputs["required"]["steps"] = ("INT", {
-            "default": 50, "min": 1, "max": 100,
-            "tooltip": "Number of sampling steps. 30-50 is recommended."
+            "default": 40, "min": 1, "max": 100,
+            "tooltip": "Number of sampling steps. 30-40 is recommended."
         })
 
         inputs["required"]["guidance_scale"] = ("FLOAT", {

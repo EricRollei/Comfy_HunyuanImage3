@@ -1,7 +1,7 @@
 [project]
 name = "hunyuanimage3"
-description = "Professional ComfyUI custom nodes for Tencent's HunyuanImage-3.0 80B multimodal model, with multiple loading modes, smart memory management, large image generation with CPU offload, and optional prompt enhancement via LLM APIs."
-version = "1.0.0"
+description = "Professional ComfyUI custom nodes for Tencent's HunyuanImage-3.0 80B multimodal model — text-to-image, Instruct editing, multi-image fusion, block swap, multiple quantization modes (BF16/INT8/NF4), smart memory management, and high-res generation."
+version = "1.1.0"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
@@ -20,7 +20,7 @@ license = {file = "LICENSE"}
 #     "Environment :: GPU :: Apple Metal",    # Apple Metal support
 # ]
 
-dependencies = ["transformers>=4.47.0", "torch>=2.7.0", "bitsandbytes>=0.45.0", "accelerate>=1.2.1", "safetensors>=0.4.5", "pillow>=11.0.0", "numpy>=1.26.0", "requests>=2.32.0"]
+dependencies = ["transformers>=4.47.0", "torch>=2.8.0", "bitsandbytes>=0.48.2", "accelerate>=1.2.1", "safetensors>=0.4.5", "huggingface_hub>=0.20.0", "pillow>=11.0.0", "numpy>=1.26.0", "requests>=2.32.0", "psutil>=5.9.0"]
 
 [project.urls]
 Repository = "https://github.com/EricRollei/Comfy_HunyuanImage3"
@@ -29,7 +29,7 @@ Documentation = "https://github.com/EricRollei/Comfy_HunyuanImage3/wiki"
 "Bug Tracker" = "https://github.com/EricRollei/Comfy_HunyuanImage3/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "ericrollei"
 DisplayName = "Comfy_HunyuanImage3"
 Icon = ""
 includes = [] 

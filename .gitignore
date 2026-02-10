@@ -162,3 +162,16 @@ test_output*.png
 # Python cache (additional patterns)
 *.pyc
 .python-version
+
+# Local example images (not for distribution)
+Docs/examples-ignore/
+
+# Dev-only docs (session notes, feature requests, implementation guides)
+Docs/SESSION_*
+Docs/edits_*
+Docs/FEATURE_REQUEST_*
+Docs/BITSANDBYTES_*
+Docs/INSTRUCT_IMPLEMENTATION*
+
+# VS Code workspace files
+*.code-workspace

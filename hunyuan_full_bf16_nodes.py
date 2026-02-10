@@ -30,10 +30,13 @@ from pathlib import Path
 import logging
 
 from .hunyuan_shared import (
+    HUNYUAN_FOLDER_NAME,
     HunyuanModelCache,
     ensure_model_on_device,
+    get_available_hunyuan_models,
     patch_dynamic_cache_dtype,
     patch_hunyuan_generate_image,
+    resolve_hunyuan_model_path,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -94,18 +97,24 @@ class HunyuanImage3FullLoader:
     
     @classmethod
     def _get_available_models(cls):
-        models_dir = folder_paths.models_dir
-        hunyuan_dir = Path(models_dir)
-        available = []
+        def _is_full_model(name):
+            return True  # All dirs checked; require_file + no quantization_metadata filter below
         
-        for item in hunyuan_dir.iterdir():
-            # Look for full model directories (exclude quantized ones)
-            if item.is_dir() and not (item / "quantization_metadata.json").exists():
-                # Check if it has model files
-                if any(item.glob("*.safetensors")) or any(item.glob("*.bin")) or (item / "config.json").exists():
-                    available.append(item.name)
-        
-        return available if available else ["HunyuanImage-3"]
+        available = get_available_hunyuan_models(
+            name_filter=lambda n: True,
+            fallback=["HunyuanImage-3"],
+        )
+        # Filter out quantized models (they have quantization_metadata.json)
+        result = []
+        for name in available:
+            resolved = resolve_hunyuan_model_path(name)
+            meta = Path(resolved) / "quantization_metadata.json"
+            if not meta.exists():
+                # Must have model files
+                p = Path(resolved)
+                if any(p.glob("*.safetensors")) or any(p.glob("*.bin")) or (p / "config.json").exists():
+                    result.append(name)
+        return result if result else ["HunyuanImage-3"]
     
     def load_model(self, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None):
         import gc
@@ -167,7 +176,7 @@ class HunyuanImage3FullLoader:
         
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         # If force_reload is True, skip cache and reload fresh
@@ -391,7 +400,7 @@ class HunyuanImage3FullGPULoader:
                 device_index = int(match.group(1))
         
         target_device = torch.device(f"cuda:{device_index}") if torch.cuda.is_available() else torch.device("cpu")
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         cached = HunyuanModelCache.get(model_path_str)
@@ -605,7 +614,7 @@ class HunyuanImage3DualGPULoader:
     def load_model(self, model_name, primary_gpu, reserve_memory_gb, exclude_gpus="", info=None):
         import os
         
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         cached = HunyuanModelCache.get(model_path_str)
@@ -924,7 +933,7 @@ class HunyuanImage3SingleGPU88GB:
     CATEGORY = "HunyuanImage3"
 
     def load_model(self, model_name, reserve_memory_gb):
-        model_path = Path(folder_paths.models_dir) / model_name
+        model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
         cached = HunyuanModelCache.get(model_path_str)
