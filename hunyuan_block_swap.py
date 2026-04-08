@@ -776,40 +776,64 @@ class BlockSwapManager:
     # Block movement
     # ------------------------------------------------------------------
     
-    def _move_block_to_device_raw(
+    def _move_nf4_block_to_device(
         self,
         block_idx: int,
         device: torch.device,
-        non_blocking: bool = None,
     ) -> float:
-        """Move a block using standard block.to() - no buffer store.
-        
-        Used during initial placement (before buffer store exists) and as
-        fallback when a block has no buffer store entry.
+        """Move an NF4 block by iterating Params4bit individually.
+
+        Params4bit.to(device, non_blocking=True) raises cudaErrorInvalidValue
+        when moving CUDA→CPU.  We work around this by moving each parameter
+        with non_blocking=False and explicitly handling quant_state tensors.
+
+        This is slower than block.to() but is the only safe way for NF4.
         """
-        if block_idx >= len(self.blocks):
-            return 0.0
-        
         block = self.blocks[block_idx]
         current_device = self.block_locations.get(block_idx)
         if current_device == device:
             return 0.0
-        
-        if non_blocking is None:
-            non_blocking = self.config.use_non_blocking
-        
+
         start_time = time.time()
-        
-        block.to(device, non_blocking=non_blocking)
-        self._fix_int8_state_devices(block, device)
-        
-        if not non_blocking and device.type == "cuda":
+
+        try:
+            from bitsandbytes.nn import Params4bit
+        except ImportError:
+            Params4bit = None
+
+        for param in block.parameters():
+            if Params4bit is not None and isinstance(param, Params4bit):
+                # Params4bit stores quantized data in .data and metadata in
+                # .quant_state (QuantState object with absmax, code, offset).
+                # We must move both; quant_state.to() handles its internals.
+                if param.data.device != device:
+                    param.data = param.data.to(device)
+                if hasattr(param, 'quant_state') and param.quant_state is not None:
+                    qs = param.quant_state
+                    if hasattr(qs, 'to'):
+                        qs.to(device)
+                    else:
+                        # QuantState may store tensors as plain attributes
+                        for attr_name in ('absmax', 'code', 'offset', 'state2', 'blocksize', 'dtype'):
+                            attr_val = getattr(qs, attr_name, None)
+                            if attr_val is not None and hasattr(attr_val, 'to') and getattr(attr_val, 'device', None) != device:
+                                setattr(qs, attr_name, attr_val.to(device))
+            else:
+                if param.device != device:
+                    param.data = param.data.to(device)
+
+        # Also move any plain buffers
+        for buf in block.buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device)
+
+        if device.type == "cuda":
             torch.cuda.synchronize(device)
-        
+
         elapsed = time.time() - start_time
         self.block_locations[block_idx] = device
         self.stats.total_swap_time_seconds += elapsed
-        
+
         if device == self.target_device:
             self.stats.total_swaps_to_gpu += 1
             self.stats.blocks_currently_on_gpu += 1
@@ -818,10 +842,61 @@ class BlockSwapManager:
             self.stats.total_swaps_to_cpu += 1
             self.stats.blocks_currently_on_gpu -= 1
             self.stats.blocks_currently_on_cpu += 1
-        
+
+        return elapsed
+
+    def _move_block_to_device_raw(
+        self,
+        block_idx: int,
+        device: torch.device,
+        non_blocking: bool = None,
+    ) -> float:
+        """Move a block using standard block.to() - no buffer store.
+
+        Used during initial placement (before buffer store exists) and as
+        fallback when a block has no buffer store entry.
+        """
+        if block_idx >= len(self.blocks):
+            return 0.0
+
+        block = self.blocks[block_idx]
+        current_device = self.block_locations.get(block_idx)
+        if current_device == device:
+            return 0.0
+
+        if non_blocking is None:
+            non_blocking = self.config.use_non_blocking
+
+        start_time = time.time()
+
+        if self._has_nf4_layers:
+            # NF4: block.to() with non_blocking=True crashes on CUDA→CPU.
+            # Use per-parameter move instead.
+            elapsed = self._move_nf4_block_to_device(block_idx, device)
+            return elapsed
+
+        block.to(device, non_blocking=non_blocking)
+        self._fix_int8_state_devices(block, device)
+
+        if not non_blocking and device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        elapsed = time.time() - start_time
+        self.block_locations[block_idx] = device
+        self.stats.total_swap_time_seconds += elapsed
+
+        if device == self.target_device:
+            self.stats.total_swaps_to_gpu += 1
+            self.stats.blocks_currently_on_gpu += 1
+            self.stats.blocks_currently_on_cpu -= 1
+        else:
+            self.stats.total_swaps_to_cpu += 1
+            self.stats.blocks_currently_on_gpu -= 1
+            self.stats.blocks_currently_on_cpu += 1
+
         if self.config.debug:
             logger.debug(f"Block {block_idx} moved to {device} in {elapsed*1000:.1f}ms (raw)")
-        
+
         return elapsed
     
     def _move_block_to_device(
@@ -956,9 +1031,11 @@ class BlockSwapManager:
         # ALWAYS check for and wait on prefetch events first
         # This must happen BEFORE checking location because prefetch updates location optimistically
         if block_idx in self._prefetch_events:
-            if self.config.debug:
-                logger.info(f"  Waiting for prefetch event...")
-            self._prefetch_events[block_idx].synchronize()
+            event = self._prefetch_events[block_idx]
+            if event is not None:
+                if self.config.debug:
+                    logger.info(f"  Waiting for prefetch event...")
+                event.synchronize()
             del self._prefetch_events[block_idx]
         else:
             # Block wasn't prefetched, need to do sync transfer
@@ -1036,40 +1113,45 @@ class BlockSwapManager:
             # Async prefetch
             block = self.blocks[prefetch_idx]
             store = self._cpu_param_store.get(prefetch_idx)
-            
-            with torch.cuda.stream(self._prefetch_stream):
-                if self._has_nf4_layers:
-                    # NF4: must use block.to() to properly move quant_state
-                    block.to(self.target_device, non_blocking=True)
-                elif self._has_int8_layers:
-                    # INT8: must use block.to() + aliasing fix.
-                    # Pinned buffer store is skipped for INT8 (WDDM issue).
-                    block.to(self.target_device, non_blocking=True)
-                    self._fix_int8_state_devices(block, self.target_device)
-                elif store is not None:
-                    # Param-level transfers from pinned buffers (fast DMA)
-                    for name, param in block.named_parameters():
-                        if param.data.device != self.target_device:
-                            param.data = param.data.to(self.target_device, non_blocking=True)
-                    
-                    for name, buf in block.named_buffers():
-                        if buf.data.device != self.target_device:
-                            buf.data = buf.data.to(self.target_device, non_blocking=True)
-                    
-                    if self._has_int8_layers:
-                        self._fix_int8_state_devices(block, self.target_device)
-                else:
-                    # Fallback: standard block.to()
-                    block.to(self.target_device, non_blocking=True)
-                    self._fix_int8_state_devices(block, self.target_device)
-                
-                # Record event for synchronization
-                event = torch.cuda.Event()
-                event.record(self._prefetch_stream)
-                self._prefetch_events[prefetch_idx] = event
-                
+
+            if self._has_nf4_layers:
+                # NF4: block.to(non_blocking=True) crashes (cudaErrorInvalidValue).
+                # Cannot use async streams — fall back to synchronous per-param move.
+                self._move_nf4_block_to_device(prefetch_idx, self.target_device)
+                self._prefetch_events[prefetch_idx] = None  # no event needed
                 self.block_locations[prefetch_idx] = self.target_device
                 self.stats.total_swaps_to_gpu += 1
+            else:
+                with torch.cuda.stream(self._prefetch_stream):
+                    if self._has_int8_layers:
+                        # INT8: must use block.to() + aliasing fix.
+                        # Pinned buffer store is skipped for INT8 (WDDM issue).
+                        block.to(self.target_device, non_blocking=True)
+                        self._fix_int8_state_devices(block, self.target_device)
+                    elif store is not None:
+                        # Param-level transfers from pinned buffers (fast DMA)
+                        for name, param in block.named_parameters():
+                            if param.data.device != self.target_device:
+                                param.data = param.data.to(self.target_device, non_blocking=True)
+
+                        for name, buf in block.named_buffers():
+                            if buf.data.device != self.target_device:
+                                buf.data = buf.data.to(self.target_device, non_blocking=True)
+
+                        if self._has_int8_layers:
+                            self._fix_int8_state_devices(block, self.target_device)
+                    else:
+                        # Fallback: standard block.to()
+                        block.to(self.target_device, non_blocking=True)
+                        self._fix_int8_state_devices(block, self.target_device)
+
+                    # Record event for synchronization
+                    event = torch.cuda.Event()
+                    event.record(self._prefetch_stream)
+                    self._prefetch_events[prefetch_idx] = event
+
+                    self.block_locations[prefetch_idx] = self.target_device
+                    self.stats.total_swaps_to_gpu += 1
             
             if self.config.debug:
                 logger.debug(f"Prefetching block {prefetch_idx}")

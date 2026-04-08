@@ -250,7 +250,10 @@ class CleanModelLoader:
             else:
                 result = cls._load_bf16(model_path, device, dtype, reserve_vram_gb)
         elif quant_type == "nf4":
-            result = cls._load_nf4(model_path, device, dtype)
+            if blocks_to_swap > 0:
+                result = cls._load_nf4_block_swap(model_path, device, dtype)
+            else:
+                result = cls._load_nf4(model_path, device, dtype)
         elif quant_type == "int8":
             if blocks_to_swap > 0:
                 result = cls._load_int8_block_swap(model_path, device, dtype)
@@ -675,7 +678,120 @@ class CleanModelLoader:
             load_time_seconds=0.0,
             uses_device_map=False
         )
-    
+
+    @classmethod
+    def _load_nf4_block_swap(
+        cls,
+        model_path: str,
+        device: str,
+        dtype: torch.dtype,
+    ) -> LoadResult:
+        """
+        Load pre-quantized NF4 model to CPU, then move non-block components to GPU.
+
+        This mirrors the proven INT8 block-swap path:
+        1. Load entire model to CPU (no quantization_config — weights are pre-quantized)
+        2. Move non-block components (VAE, embeddings, projections) to GPU
+        3. Leave 32 transformer blocks on CPU for BlockSwapManager
+        4. BlockSwapManager handles GPU↔CPU swapping during inference
+
+        Pre-quantized NF4 models store weights as Params4bit on disk.
+        Params4bit.to(device) supports GPU↔CPU movement, making block swap viable.
+        The BlockSwapManager already detects NF4 layers and uses block.to() instead
+        of the buffered path to properly handle quant_state tensors.
+
+        Returns a LoadResult with is_moveable=True (blocks can be swapped).
+        """
+        logger.info(f"Loading NF4 model from {model_path} (block-swap mode)")
+        logger.info("NF4 model → CPU first, then non-block parts to GPU")
+        logger.info("Transformer blocks will be managed by BlockSwapManager")
+
+        # Clear CUDA cache before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Log system RAM availability
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            logger.info(
+                f"System RAM: {ram.available / 1024**3:.1f}GB available / "
+                f"{ram.total / 1024**3:.1f}GB total ({ram.percent:.1f}% used)"
+            )
+        except ImportError:
+            pass
+
+        # Load entirely to CPU — no quantization_config needed for pre-quantized models
+        logger.info("Loading pre-quantized NF4 model to CPU (low_cpu_mem_usage=True)...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+                # No quantization_config — model is pre-quantized on disk
+            )
+        except TypeError:
+            logger.warning("Falling back to minimal load args")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+
+        # Move non-block components to GPU
+        target = torch.device(device)
+        moved_gb = _move_non_block_components_to_gpu(model, target)
+        logger.info(f"Moved {moved_gb:.2f}GB of non-block components to {device}")
+
+        # Remove stale hf_device_map (we manage placement ourselves now)
+        if hasattr(model, "hf_device_map"):
+            delattr(model, "hf_device_map")
+
+        # Remove any accelerate dispatch hooks installed by device_map="cpu"
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for _name, module in model.named_modules():
+                if hasattr(module, "_hf_hook"):
+                    remove_hook_from_module(module)
+                # Clean up stale instance-level forward left by hook removal
+                if "forward" in vars(module):
+                    try:
+                        delattr(module, "forward")
+                    except Exception:
+                        pass
+        except (ImportError, Exception):
+            pass
+
+        # Load tokenizer
+        if hasattr(model, 'load_tokenizer'):
+            model.load_tokenizer(model_path)
+            logger.info("Tokenizer loaded")
+
+        # Ensure VAE is in full precision on GPU
+        if hasattr(model, 'vae'):
+            model.vae = model.vae.to(device=target, dtype=dtype)
+            logger.info("VAE configured in full precision (bfloat16)")
+
+        logger.info("NF4 model ready for block-swap inference")
+
+        return LoadResult(
+            model=model,
+            quant_type="nf4",
+            is_moveable=True,  # Blocks can be moved GPU↔CPU for block swap
+            device=device,
+            dtype=dtype,
+            load_time_seconds=0.0,
+            uses_device_map=False,
+        )
+
     @classmethod
     def _load_int8_block_swap(
         cls,

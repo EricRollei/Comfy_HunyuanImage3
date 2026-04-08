@@ -2332,6 +2332,17 @@ def patch_hunyuan_generate_image(model):
     t2i_system_prompts = getattr(model_module, "t2i_system_prompts", None)
     default = getattr(model_module, "default", lambda val, d: val if val is not None else d)
     
+    # Determine the correct generation method at patch time.
+    # v1 models (GenerationMixin) expose _generate() internally.
+    # v2 models may only have generate() without _generate().
+    _gen_method = getattr(model, '_generate', None)
+    if _gen_method is None:
+        _gen_method = getattr(model, 'generate', None)
+        if _gen_method is not None:
+            logger.info("Model has no _generate — patch will use generate() instead")
+        else:
+            logger.warning("Model has neither _generate nor generate — patch may not work correctly")
+
     def new_generate_image(
             self,
             prompt,
@@ -2365,7 +2376,7 @@ def patch_hunyuan_generate_image(model):
                 prompt=prompt, bot_task=bot_task, system_prompt=system_prompt, max_new_tokens=max_new_tokens)
             print(f"<{bot_task}>", end="", flush=True)
             # Do NOT pass callback_on_step_end here
-            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            outputs = _gen_method(**model_inputs, **kwargs, verbose=verbose)
             cot_text = self.get_cot_text(outputs[0])
             # Switch system_prompt to `en_recaption` if drop_think is enabled.
             if self.generation_config.drop_think and system_prompt:
@@ -2378,7 +2389,7 @@ def patch_hunyuan_generate_image(model):
             model_inputs = self.prepare_model_inputs(
                 prompt=prompt, cot_text=cot_text, bot_task="img_ratio", system_prompt=system_prompt, seed=seed)
             # Do NOT pass callback_on_step_end here
-            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            outputs = _gen_method(**model_inputs, **kwargs, verbose=verbose)
             ratio_index = outputs[0, -1].item() - self._tkwrapper.ratio_token_offset
             # In some cases, the generated ratio_index is out of range. A valid ratio_index should be in [0, 32].
             # If ratio_index is out of range, we set it to 16 (i.e., 1:1).
@@ -2392,16 +2403,16 @@ def patch_hunyuan_generate_image(model):
             prompt=prompt, cot_text=cot_text, system_prompt=system_prompt, mode="gen_image", seed=seed,
             image_size=image_size,
         )
-        
+
         # Ensure we don't pass callback_on_step_end if it's None, just to be safe
         gen_kwargs = kwargs.copy()
         if callback_on_step_end is not None:
             gen_kwargs["callback_on_step_end"] = callback_on_step_end
         if latents is not None:  # LATENT CONTROL: pass through custom latents
             gen_kwargs["latents"] = latents
-            
+
         # PASS callback_on_step_end here
-        outputs = self._generate(**model_inputs, **gen_kwargs, verbose=verbose)
+        outputs = _gen_method(**model_inputs, **gen_kwargs, verbose=verbose)
         return outputs[0]
 
     logger.info("Patching model.generate_image to support progress bars...")
