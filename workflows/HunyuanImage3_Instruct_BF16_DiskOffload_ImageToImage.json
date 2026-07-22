@@ -1,0 +1,309 @@
+{
+  "last_node_id": 5,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "HunyuanInstructLoader",
+      "pos": [
+        20,
+        20
+      ],
+      "size": [
+        440,
+        410
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "HUNYUAN_INSTRUCT_MODEL",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "title": "1. Full BF16 Loader — CUDA / CPU / Disk",
+      "properties": {
+        "Node name for S&R": "HunyuanInstructLoader"
+      },
+      "widgets_values": [
+        "HunyuanImage-3.0-Instruct",
+        false,
+        "sdpa",
+        "eager",
+        8.0,
+        0,
+        true,
+        "bfloat16",
+        true,
+        "",
+        32
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        20,
+        500
+      ],
+      "size": [
+        330,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0,
+          "shape": 3
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1,
+          "shape": 3
+        }
+      ],
+      "title": "2. Select Input Image",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "input.png",
+        "image"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "ImageScale",
+      "pos": [
+        410,
+        530
+      ],
+      "size": [
+        320,
+        140
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3
+          ],
+          "slot_index": 0,
+          "shape": 3
+        }
+      ],
+      "title": "3. Scale Input to 512×512 for Lower Peak Memory",
+      "properties": {
+        "Node name for S&R": "ImageScale"
+      },
+      "widgets_values": [
+        "lanczos",
+        512,
+        512,
+        "center"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "HunyuanInstructImageEdit",
+      "pos": [
+        800,
+        20
+      ],
+      "size": [
+        570,
+        650
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "HUNYUAN_INSTRUCT_MODEL",
+          "link": 1,
+          "slot_index": 0
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 3,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0,
+          "shape": 3
+        },
+        {
+          "name": "cot_reasoning",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1,
+          "shape": 3
+        },
+        {
+          "name": "status",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 2,
+          "shape": 3
+        }
+      ],
+      "title": "4. Image to Image — Direct Image Mode / 40 Steps",
+      "properties": {
+        "Node name for S&R": "HunyuanInstructImageEdit"
+      },
+      "widgets_values": [
+        "Change the background to a warm sunset scene. Preserve the subject, facial features, pose, clothing, composition, and every detail not explicitly mentioned.",
+        "image",
+        123456789,
+        "dynamic",
+        true,
+        "Auto (model predicts)",
+        40,
+        -1.0,
+        2.8,
+        2048,
+        0
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SaveImage",
+      "pos": [
+        1430,
+        120
+      ],
+      "size": [
+        360,
+        430
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "title": "5. Save Edited Image",
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "HunyuanImage3_BF16_DiskOffload_I2I"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      4,
+      0,
+      "HUNYUAN_INSTRUCT_MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      1,
+      "IMAGE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Experimental Full-BF16 Image to Image",
+      "bounding": [
+        -10,
+        -20,
+        1840,
+        900
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.72,
+      "offset": [
+        55,
+        75
+      ]
+    },
+    "info": {
+      "fork": "foxidermist/Comfy_HunyuanImage3",
+      "mode": "full BF16 CUDA/CPU/disk offload",
+      "settings": {
+        "vram_reserve_gb": 8,
+        "cpu_memory_limit_gb": 32,
+        "blocks_to_swap": 0,
+        "use_disk_offload": true,
+        "bot_task": "image",
+        "steps": 40
+      }
+    }
+  },
+  "version": 0.4
+}

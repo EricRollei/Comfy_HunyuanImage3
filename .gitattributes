@@ -1,0 +1,7 @@
+README.md -text
+hunyuan_instruct_nodes.py -text
+LOW_MEMORY_BF16.md text eol=lf
+README_WORKFLOWS_SECTION.md text eol=lf
+workflows/*.md text eol=lf
+workflows/*.json text eol=lf
+tools/*.bat text eol=crlf

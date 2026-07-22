@@ -23,6 +23,22 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 
 > **🙏 Acknowledgment**: This project integrates the HunyuanImage-3.0 model developed by **Tencent Hunyuan Team** and uses their official system prompts. The model and original code are licensed under [Apache 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE). This integration code is separately licensed under CC BY-NC 4.0 for non-commercial use.
 
+
+> [!IMPORTANT]
+> **Unofficial low-memory fork by [foxidermist](https://github.com/foxidermist).**
+> This fork adds an experimental CUDA/CPU/disk-backed loading path for the full
+> `HunyuanImage-3.0-Instruct` BF16 checkpoint on systems that cannot hold the
+> model in GPU VRAM or physical RAM.
+>
+> A complete image-edit generation was successfully tested on an NVIDIA RTX
+> 5070 with 12 GB VRAM, 64 GB system RAM, and a 96 GB Windows pagefile. This
+> mode is extremely slow and remains experimental. It does not replace the
+> upstream hardware recommendations for normal full-BF16 operation.
+>
+> See **[LOW_MEMORY_BF16.md](LOW_MEMORY_BF16.md)** for installation, tested
+> dependency versions, loader settings, expected logs, troubleshooting, and
+> limitations.
+
 ## 📋 TODO / Known Issues
 
 - [x] **NF4 Low VRAM Loader**: Custom device map keeps NF4 layers on GPU so 24‑32 GB cards can use the Low VRAM Budget workflow without bitsandbytes errors.
@@ -38,6 +54,7 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 
 - **Multiple Loading Modes**: Full BF16, INT8/NF4 Quantized, Single GPU, Multi-GPU
 - **Smart Memory Management**: Automatic VRAM tracking, cleanup, and optimization
+- **Experimental Full-BF16 Disk Offload**: Run the full Instruct BF16 checkpoint using CUDA, capped CPU RAM, and disk-backed safetensors on otherwise unsupported low-memory systems
 - **High-Quality Image Generation**: 
   - Standard generation (<2MP) - Fast, GPU-only
   - Large image generation (2MP-8MP+) - CPU offload support
@@ -66,6 +83,13 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 - **Minimum 80GB VRAM** (or multi-GPU) for full BF16 model
 - Python 3.10+
 - PyTorch 2.9+ with CUDA 12.8+ (recommended for best performance)
+
+
+> [!NOTE]
+> The minimum-VRAM figures above describe the normal upstream loading paths.
+> The experimental low-memory BF16 mode in this fork has separately been tested
+> with 12 GB VRAM and 64 GB RAM by streaming most BF16 weights from disk. It is
+> dramatically slower and requires substantial virtual memory.
 
 ### System Requirements & Hardware Recommendations
 
@@ -130,19 +154,60 @@ Both variants are available in BF16, INT8, and NF4 quantization.
 | Instruct (full) | INT8 | ~81 GB | 96 GB | Required | ✅ Working |
 | Instruct (full) | BF16 | ~160 GB | 96 GB | Required | ✅ Working |
 
+
+#### Experimental Full-BF16 Instruct Disk Offload (This Fork)
+
+This fork adds a separate loading mode for systems far below the normal
+full-BF16 memory envelope. It uses an Accelerate device map spanning CUDA,
+CPU RAM, and disk-backed safetensors.
+
+| Component | Tested configuration |
+|---|---|
+| GPU | NVIDIA RTX 5070, 12 GB VRAM |
+| System RAM | 64 GB |
+| Virtual memory | 96 GB Windows pagefile |
+| Checkpoint | `tencent/HunyuanImage-3.0-Instruct`, full BF16 |
+| Transformers | `4.57.6` |
+| Accelerate | `1.14.0` |
+| Loader mode | BF16, disk offload enabled, block swap disabled |
+| Performance | Approximately 2.5–3 minutes per diffusion step in the tested workflow |
+
+This mode is intended for experimentation, compatibility testing, and users
+who accept severe I/O bottlenecks. A quantized checkpoint or a larger GPU is
+still preferable for routine work.
+
+See [LOW_MEMORY_BF16.md](LOW_MEMORY_BF16.md) before enabling this mode.
+
 ### Quick Install
 
 1. **Clone this repository** into your ComfyUI custom nodes folder:
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/ericRollei/Eric_Hunyuan3.git
+git clone https://github.com/foxidermist/Comfy_HunyuanImage3.git
 ```
 
 2. **Install dependencies**:
 ```bash
-cd Eric_Hunyuan3
+cd Comfy_HunyuanImage3
 pip install -r requirements.txt
 ```
+
+
+For the tested Windows low-memory BF16 path, completely close ComfyUI and run:
+
+```bat
+tools\fix_hunyuan_accelerate_transformers.bat
+```
+
+The helper pins the versions used during successful testing:
+
+```text
+accelerate==1.14.0
+transformers==4.57.6
+```
+
+Do not apply these pins blindly to an unrelated ComfyUI installation. They
+are documented for this fork's experimental full-BF16 Instruct path.
 
 3. **Download model weights**:
 
@@ -377,8 +442,45 @@ The **HunyuanImage-3.0-Instruct** models extend the base model with powerful new
 | `force_reload` | Force reload even if cached | False |
 | `attention_impl` | Attention implementation (`sdpa` recommended) | sdpa |
 | `moe_impl` | MoE implementation (keep `eager` unless you have flashinfer) | eager |
-| `vram_reserve_gb` | VRAM to keep free for inference (auto-boosted for CFG models) | 30.0 |
+| `vram_reserve_gb` | VRAM reserved for inference. Low-memory GPUs are clamped to a tested 5 GB reserve | 8.0 |
 | `blocks_to_swap` | Number of transformer blocks to swap between GPU↔CPU (0 = no swap) | 0 |
+| `moe_drop_tokens` | Limit MoE expert capacity to reduce peak memory | True |
+| `vae_dtype` | VAE decode precision (`bfloat16` or `float32`) | bfloat16 |
+| `use_disk_offload` | For BF16 with `blocks_to_swap=0`, allow CUDA/CPU/disk placement | True |
+| `disk_offload_dir` | Portable Accelerate offload/cache directory; may remain empty when source safetensors are mapped directly | Platform cache directory |
+| `cpu_memory_limit_gb` | Maximum physical-RAM budget used for BF16 model placement | 32 |
+
+
+### Experimental BF16 Disk-Offload Quick Start
+
+For the successfully tested 12 GB VRAM / 64 GB RAM configuration:
+
+| Setting | Value |
+|---|---|
+| `quant_type` | `bf16` |
+| `blocks_to_swap` | `0` |
+| `use_disk_offload` | `true` |
+| `vram_reserve_gb` | `5` |
+| `cpu_memory_limit_gb` | `16` |
+| `moe_drop_tokens` | `true` |
+| `vae_dtype` | `bfloat16` |
+| `bot_task` | `image` |
+| Initial test steps | `4` |
+| Initial input size | `512×512` where practical |
+
+The loader should report a device map containing all three targets:
+
+```text
+Model distributed across: 0, cpu, disk
+```
+
+It should also report one or more modules mapped to disk. An empty
+`disk_offload_dir` does not necessarily mean disk offload is inactive:
+Transformers and Accelerate may read individual tensors directly from the
+original sharded `safetensors` files.
+
+Full setup and troubleshooting are documented in
+[LOW_MEMORY_BF16.md](LOW_MEMORY_BF16.md).
 
 ### Block Swap (VRAM Management)
 
@@ -573,6 +675,20 @@ python hunyuan_quantize_instruct_distil_nf4.py \
 3. **RAM usage accumulates** — The Instruct Unload node clears the model cache, but some references may persist across successive loads. If you notice RAM creeping up, restart ComfyUI. A fix is planned.
 
 4. **Instruct models need `trust_remote_code=True`** — The loader handles this automatically. The Instruct models include custom model code that must be executed.
+
+
+5. **Experimental BF16 disk offload is I/O-bound** — Most model weights may be
+   read from sharded `safetensors` for every active module. Low average GPU and
+   RAM utilization is expected because the GPU frequently waits for disk and
+   PCIe transfers.
+
+6. **Soft Unload is not compatible with disk-mapped models** — Models loaded
+   with an Accelerate `device_map` contain `meta` parameters and should be fully
+   unloaded or ComfyUI should be restarted instead.
+
+7. **The offload directory may remain empty** — With sharded safetensors,
+   Accelerate can use the original checkpoint files as the disk backing store.
+   Confirm operation from the logged `hf_device_map`, not from folder size.
 
 ---
 
@@ -1230,6 +1346,27 @@ Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
 
 ## 🔄 Changelog
 
+
+### Unreleased Fork Changes
+
+**Experimental low-memory full-BF16 Instruct support:**
+
+- Added CUDA/CPU/disk device mapping for BF16 Instruct models
+- Added configurable physical-RAM and disk-offload budgets
+- Added portable offload-directory selection and
+  `HUNYUAN_DISK_OFFLOAD_DIR` override
+- Added Windows pagefile / Linux and macOS swap diagnostics
+- Added a compatibility fallback for missing `config.model_version`
+- Added an image-processor method alias for upstream API drift
+- Fixed SigLIP2 positional embeddings remaining on the `meta` device
+- Fixed `MultiheadAttention.out_proj` remaining on `meta` during offload
+- Added logging for the final device map and disk-mapped module count
+- Documented the successfully tested 12 GB VRAM / 64 GB RAM configuration
+
+These changes affect loading, device placement, diagnostics, and compatibility.
+The original generation, CFG, VAE, quantized loading, and block-swap paths are
+otherwise retained.
+
 ### v1.3.0 (2026-02-12)
 
 **INT8 Instruct Fix (5 bugs):**
@@ -1291,3 +1428,13 @@ Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
 ---
 
 **Made with ❤️ for the ComfyUI community**
+
+## Example Low-Memory Workflows
+
+Ready-to-import ComfyUI workflows are included in [`workflows/`](workflows/):
+
+- [Full-BF16 Text to Image](workflows/HunyuanImage3_Instruct_BF16_DiskOffload_TextToImage.json)
+- [Full-BF16 Image to Image](workflows/HunyuanImage3_Instruct_BF16_DiskOffload_ImageToImage.json)
+
+Both examples use disk offload, no block swap, direct `image` mode, and 40
+steps. See [`workflows/README.md`](workflows/README.md) before running them.

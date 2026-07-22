@@ -1,22 +1,28 @@
 """
 HunyuanImage-3.0 Instruct Nodes for ComfyUI
 
-Dedicated nodes for the new HunyuanImage-3.0-Instruct and Instruct-Distil models.
+Dedicated nodes for the HunyuanImage-3.0-Instruct and Instruct-Distil models.
 These models support:
 - Built-in prompt enhancement (no external API needed)
 - Chain-of-Thought (CoT) reasoning
 - Image-to-Image editing
 - Multi-image fusion (up to 3 images)
 - Block swap for NF4, INT8, and BF16 (CPU↔GPU block swapping)
+- Experimental low-memory BF16 CUDA/CPU/disk offload
 
-Author: Eric Hiss (GitHub: EricRollei)
+Original author: Eric Hiss (GitHub: EricRollei)
 License: Dual License (Non-Commercial and Commercial Use)
 Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
+
+This is an unofficial low-memory adaptation. It preserves the original
+generation logic while adding portable disk-offload configuration and
+compatibility fixes for offloaded HunyuanImage/SigLIP2 modules.
 """
 
 import gc
 import logging
 import os
+import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -42,11 +48,9 @@ try:
         get_available_hunyuan_models,
         patch_dynamic_cache_dtype,
         patch_hunyuan_static_cache_device,
-        patch_model_device_meta_safe,
         patch_pipeline_pre_vae_cleanup,
         patch_static_cache_lazy_init,
         patch_to_device_for_instruct,
-        strip_accelerate_hooks_from_vae,
         clear_generation_cache,
         resolve_hunyuan_model_path,
     )
@@ -58,11 +62,9 @@ except ImportError:
             get_available_hunyuan_models,
             patch_dynamic_cache_dtype,
             patch_hunyuan_static_cache_device,
-            patch_model_device_meta_safe,
             patch_pipeline_pre_vae_cleanup,
             patch_static_cache_lazy_init,
             patch_to_device_for_instruct,
-            strip_accelerate_hooks_from_vae,
             clear_generation_cache,
             resolve_hunyuan_model_path,
         )
@@ -71,11 +73,9 @@ except ImportError:
         SHARED_UTILS_AVAILABLE = False
         patch_dynamic_cache_dtype = None
         patch_hunyuan_static_cache_device = None
-        patch_model_device_meta_safe = None
         patch_pipeline_pre_vae_cleanup = None
         patch_static_cache_lazy_init = None
         patch_to_device_for_instruct = None
-        strip_accelerate_hooks_from_vae = None
         clear_generation_cache = None
 
 # Import block swap manager
@@ -92,6 +92,372 @@ except ImportError:
         BlockSwapManager = None
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Portable BF16 SSD offload configuration
+# =============================================================================
+
+def _default_bf16_disk_offload_dir() -> str:
+    """Return a writable, platform-appropriate default offload directory.
+
+    The location can be overridden without editing this file by setting the
+    ``HUNYUAN_DISK_OFFLOAD_DIR`` environment variable.
+    """
+    override = os.environ.get("HUNYUAN_DISK_OFFLOAD_DIR", "").strip()
+    if override:
+        return os.path.abspath(
+            os.path.expanduser(os.path.expandvars(override))
+        )
+
+    home = os.path.expanduser("~")
+
+    if os.name == "nt":
+        cache_root = os.environ.get("LOCALAPPDATA")
+        if not cache_root:
+            cache_root = os.path.join(home, "AppData", "Local")
+    elif sys.platform == "darwin":
+        cache_root = os.path.join(home, "Library", "Caches")
+    else:
+        cache_root = os.environ.get("XDG_CACHE_HOME")
+        if not cache_root:
+            cache_root = os.path.join(home, ".cache")
+
+    return os.path.join(
+        cache_root,
+        "ComfyUI",
+        "HunyuanImage3",
+        "disk_offload",
+    )
+
+
+# The full BF16 checkpoint is larger than the memory available on many
+# consumer systems. Accelerate can keep most modules backed by safetensors on
+# disk and materialize them only while each module is being executed.
+DEFAULT_BF16_DISK_OFFLOAD_DIR = _default_bf16_disk_offload_dir()
+DEFAULT_BF16_CPU_MEMORY_LIMIT_GIB = 32
+LOW_VRAM_THRESHOLD_GIB = 24.0
+LOW_VRAM_RESERVE_GIB = 5.0
+# At least one indivisible Hunyuan transformer module needs about 4.65 GiB.
+# A smaller budget yields a cpu+disk-only map, making CPU the execution device.
+LOW_VRAM_GPU_MODEL_BUDGET_GIB = 5.0
+
+
+def _prepare_bf16_disk_offload(
+    model_path: str,
+    offload_root: str,
+    requested_cpu_limit_gib: int,
+    requested_vram_reserve_gib: float,
+) -> Tuple[str, Dict[Any, Any]]:
+    """Prepare an Accelerate device map budget for BF16 SSD offload.
+
+    The checkpoint remains in ``model_path``. Accelerate may use the original
+    sharded safetensors directly or create auxiliary files under
+    ``offload_root/<model-name>``. CPU RAM is deliberately capped so the
+    operating system retains headroom; pagefile or swap may still be required.
+    """
+    import psutil
+    import shutil
+
+    model_name = os.path.basename(os.path.normpath(model_path)) or "HunyuanImage3"
+    safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_name)
+
+    normalized_offload_root = (offload_root or "").strip()
+    if not normalized_offload_root:
+        normalized_offload_root = DEFAULT_BF16_DISK_OFFLOAD_DIR
+    normalized_offload_root = os.path.abspath(
+        os.path.expanduser(os.path.expandvars(normalized_offload_root))
+    )
+
+    offload_dir = os.path.join(normalized_offload_root, safe_name)
+    os.makedirs(offload_dir, exist_ok=True)
+
+    ram = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    available_ram_gib = ram.available / 1024**3
+    total_ram_gib = ram.total / 1024**3
+    pagefile_total_gib = swap.total / 1024**3
+    pagefile_free_gib = swap.free / 1024**3
+    estimated_commit_limit_gib = total_ram_gib + pagefile_total_gib
+
+    # Accelerate's max_memory["cpu"] is a placement budget, not a requirement
+    # that at least 16 GiB must be resident in physical RAM.  A small budget is
+    # valid when most modules are assigned to the explicit SSD offload folder.
+    # Keep roughly 8 GiB of currently available RAM outside the model budget for
+    # Windows, ComfyUI, Python, CUDA bookkeeping and transient shard loading.
+    if available_ram_gib < 8.0:
+        raise RuntimeError(
+            f"Too little free physical RAM to start BF16 disk offload: "
+            f"{available_ram_gib:.1f} GiB available. Close other programs and retry."
+        )
+
+    max_safe_cpu_gib = max(4, int(available_ram_gib - 8.0))
+    safe_cpu_limit = int(max(4, min(requested_cpu_limit_gib, max_safe_cpu_gib)))
+    if safe_cpu_limit != requested_cpu_limit_gib:
+        logger.warning(
+            f"  CPU placement budget reduced from {requested_cpu_limit_gib} GiB "
+            f"to {safe_cpu_limit} GiB to preserve host-memory headroom."
+        )
+
+    logger.info(
+        f"  Physical RAM: {available_ram_gib:.1f} GiB available / "
+        f"{total_ram_gib:.1f} GiB total"
+    )
+    virtual_memory_name = "Windows pagefile" if os.name == "nt" else "Swap"
+    logger.info(
+        f"  {virtual_memory_name}: {pagefile_free_gib:.1f} GiB free / "
+        f"{pagefile_total_gib:.1f} GiB total; estimated RAM + virtual-memory "
+        f"limit ~{estimated_commit_limit_gib:.1f} GiB"
+    )
+    if estimated_commit_limit_gib < 185.0:
+        if os.name == "nt":
+            logger.warning(
+                "  The RAM + pagefile commit limit is below ~185 GiB. "
+                "Windows may raise OS error 1455 while Transformers maps "
+                "the ~160 GiB checkpoint and creates temporary loading objects."
+            )
+        else:
+            logger.warning(
+                "  RAM + swap is below ~185 GiB. Loading the full BF16 "
+                "checkpoint may fail if temporary allocations exceed the "
+                "available virtual-memory limit."
+            )
+
+    max_memory: Dict[Any, Any] = {}
+
+    if torch.cuda.is_available():
+        free_bytes, _ = torch.cuda.mem_get_info(0)
+        free_vram_gib = free_bytes / 1024**3
+        # Keep the resident model budget tiny.  Disk/CPU modules are copied to
+        # the execution GPU only for their forward pass.
+        usable_after_reserve = max(1.0, free_vram_gib - requested_vram_reserve_gib)
+        gpu_budget_gib = max(1.0, min(LOW_VRAM_GPU_MODEL_BUDGET_GIB, usable_after_reserve))
+        max_memory[0] = f"{gpu_budget_gib:.0f}GiB"
+        logger.info(
+            f"  SSD offload GPU budget: {gpu_budget_gib:.1f} GiB; "
+            f"requested inference reserve: {requested_vram_reserve_gib:.1f} GiB"
+        )
+        if gpu_budget_gib < 4.7:
+            logger.warning(
+                "  GPU placement budget is below the ~4.65 GiB minimum module size. "
+                "Accelerate may create a cpu+disk-only map. Lower vram_reserve_gb "
+                "to 5 GiB and retry so CUDA becomes the execution device."
+            )
+
+    # Keep CPU last in max_memory so Accelerate considers CUDA before CPU.
+    max_memory["cpu"] = f"{safe_cpu_limit}GiB"
+
+    try:
+        disk = shutil.disk_usage(offload_dir)
+        disk_free_gib = disk.free / 1024**3
+        logger.info(f"  SSD offload directory: {offload_dir}")
+        logger.info(f"  SSD free space: {disk_free_gib:.1f} GiB")
+        if disk_free_gib < 170:
+            logger.warning(
+                "  Less than 170 GiB is free in the SSD offload location. "
+                "The BF16 offload cache may not fit."
+            )
+    except Exception as exc:
+        logger.warning(f"  Could not inspect SSD free space: {exc}")
+
+    logger.info(
+        f"  SSD offload CPU budget: {safe_cpu_limit} GiB "
+        f"({available_ram_gib:.1f} GiB currently available)"
+    )
+    return offload_dir, max_memory
+
+
+def _patch_siglip2_position_embedding_for_disk_offload(model: Any) -> bool:
+    """Fix SigLIP2 positional embeddings when their nn.Embedding is disk-offloaded.
+
+    The official Siglip2VisionEmbeddings.forward() reads
+    ``self.position_embedding.weight`` directly instead of calling the
+    registered ``nn.Embedding`` submodule. Accelerate attaches the SSD/CPU
+    materialization hook to that submodule, so direct weight access leaves the
+    parameter on the meta device.
+
+    This patch keeps Accelerate's hook wrapper intact and replaces only the
+    wrapped implementation. Calling ``self.position_embedding(position_ids)``
+    triggers the normal pre/post hooks: the tiny positional table is loaded
+    for the operation and can be offloaded again immediately afterwards.
+    """
+    import types
+
+    vision_model = getattr(model, "vision_model", None)
+    embeddings = getattr(vision_model, "embeddings", None)
+    position_embedding = getattr(embeddings, "position_embedding", None)
+
+    if embeddings is None or position_embedding is None:
+        logger.debug("  SigLIP2 disk-offload patch skipped: embeddings not found")
+        return False
+
+    if getattr(embeddings, "_hunyuan_position_embedding_offload_patch", False):
+        return True
+
+    def _disk_safe_embeddings_forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        spatial_shapes: torch.LongTensor,
+    ) -> torch.Tensor:
+        # patch_embedding is called normally, so its Accelerate hook can
+        # materialize an offloaded weight before the linear projection.
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
+
+        # CRITICAL: invoke the nn.Embedding module instead of reading
+        # position_embedding.weight directly. The module call activates its
+        # Accelerate hook and returns a real tensor rather than a meta tensor.
+        position_ids = torch.arange(
+            self.num_patches,
+            device=patch_embeds.device,
+            dtype=torch.long,
+        )
+        positional_embeddings = self.position_embedding(position_ids)
+        positional_embeddings = positional_embeddings.reshape(
+            self.position_embedding_size,
+            self.position_embedding_size,
+            -1,
+        )
+
+        resized_positional_embeddings = self.resize_positional_embeddings(
+            positional_embeddings,
+            spatial_shapes,
+            max_length=pixel_values.shape[1],
+        )
+        if resized_positional_embeddings.device != patch_embeds.device:
+            resized_positional_embeddings = resized_positional_embeddings.to(
+                device=patch_embeds.device,
+                dtype=patch_embeds.dtype,
+            )
+        elif resized_positional_embeddings.dtype != patch_embeds.dtype:
+            resized_positional_embeddings = resized_positional_embeddings.to(
+                dtype=patch_embeds.dtype
+            )
+
+        return patch_embeds + resized_positional_embeddings
+
+    patched_forward = types.MethodType(_disk_safe_embeddings_forward, embeddings)
+
+    # Accelerate wraps module.forward and stores the original callable in
+    # _old_forward. Replacing _old_forward preserves the pre/post offload hook.
+    if hasattr(embeddings, "_old_forward"):
+        embeddings._old_forward = patched_forward
+        patch_target = "_old_forward (Accelerate hook preserved)"
+    else:
+        embeddings.forward = patched_forward
+        patch_target = "forward"
+
+    embeddings._hunyuan_position_embedding_offload_patch = True
+
+    mapped_device = None
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, dict):
+        full_name = "vision_model.embeddings.position_embedding"
+        best_prefix = ""
+        for module_name, device in device_map.items():
+            if (
+                full_name == module_name
+                or full_name.startswith(module_name + ".")
+                or module_name == ""
+            ):
+                if len(module_name) >= len(best_prefix):
+                    best_prefix = module_name
+                    mapped_device = device
+
+    logger.warning(
+        "  Compatibility fix: patched SigLIP2 positional embedding access for "
+        f"SSD/CPU offload via {patch_target}"
+        + (
+            f" (device-map target: {mapped_device})."
+            if mapped_device is not None
+            else "."
+        )
+    )
+    return True
+
+
+def _patch_multihead_attention_offload_hooks(model: Any) -> int:
+    """Make Accelerate preload child weights of nn.MultiheadAttention.
+
+    PyTorch's MultiheadAttention.forward() uses ``out_proj.weight`` and
+    ``out_proj.bias`` directly inside ``F.multi_head_attention_forward``.
+    It does not call ``out_proj.forward()``, so an Accelerate hook attached
+    only to the child Linear module never fires.  When that child is CPU/disk
+    offloaded, its tensors therefore remain on the meta device.
+
+    Setting ``place_submodules=True`` on the parent MHA AlignDevicesHook makes
+    its pre-forward materialize both the direct MHA parameters and parameters
+    of registered child modules.  The corresponding post-forward then
+    offloads them again, preserving the low-memory execution model.
+    """
+
+    def _enable_on_hook(hook: Any) -> bool:
+        changed = False
+
+        if hasattr(hook, "place_submodules"):
+            if not bool(getattr(hook, "place_submodules")):
+                hook.place_submodules = True
+                changed = True
+
+        # Accelerate may wrap several hooks in a SequentialHook.
+        nested = getattr(hook, "hooks", None)
+        if nested:
+            for child_hook in nested:
+                changed = _enable_on_hook(child_hook) or changed
+
+        return changed
+
+    patched = 0
+    already_enabled = 0
+    meta_out_proj = 0
+
+    for module_name, module in model.named_modules():
+        if not isinstance(module, torch.nn.MultiheadAttention):
+            continue
+
+        out_proj = getattr(module, "out_proj", None)
+        if out_proj is not None:
+            for param in out_proj.parameters(recurse=False):
+                if getattr(param, "device", None) is not None and param.device.type == "meta":
+                    meta_out_proj += 1
+                    break
+
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None:
+            continue
+
+        if _enable_on_hook(hook):
+            patched += 1
+            logger.warning(
+                "  Compatibility fix: enabled Accelerate submodule preloading "
+                f"for MultiheadAttention '{module_name}'."
+            )
+        else:
+            # Count hooks that already expose an enabled place_submodules flag.
+            hook_stack = [hook]
+            enabled = False
+            while hook_stack:
+                current = hook_stack.pop()
+                if bool(getattr(current, "place_submodules", False)):
+                    enabled = True
+                    break
+                nested = getattr(current, "hooks", None)
+                if nested:
+                    hook_stack.extend(nested)
+            if enabled:
+                already_enabled += 1
+
+    if patched or already_enabled:
+        logger.warning(
+            "  MultiheadAttention offload compatibility: "
+            f"{patched} hooks patched, {already_enabled} already compatible; "
+            f"{meta_out_proj} modules had meta out_proj parameters."
+        )
+    else:
+        logger.debug(
+            "  MultiheadAttention offload patch found no Accelerate hooks to modify."
+        )
+
+    return patched
 
 # =============================================================================
 # Constants and Configuration
@@ -176,13 +542,6 @@ INSTRUCT_RESOLUTION_PRESETS = {
 }
 
 RESOLUTION_LIST = list(INSTRUCT_RESOLUTION_PRESETS.keys())
-
-# Legacy alias: older saved workflows stored the raw value "auto" instead of
-# the display key "Auto (model predicts)". Keep the dict entry so
-# parse_resolution() resolves it, but do NOT add it to RESOLUTION_LIST (would
-# create a duplicate "auto" entry in the dropdown). Old workflows loading with
-# "auto" will need the user to re-pick "Auto (model predicts)" once.
-INSTRUCT_RESOLUTION_PRESETS.setdefault("auto", "auto")
 
 
 # =============================================================================
@@ -719,29 +1078,6 @@ def parse_resolution(resolution_name: str) -> Tuple[str, Optional[int], Optional
     else:
         height, width = value
         return ("fixed", height, width)
-
-
-# Numeric bucket list (H, W), excluding non-tuple sentinel entries like "auto".
-_BUCKET_HW = [v for v in INSTRUCT_RESOLUTION_PRESETS.values() if isinstance(v, tuple)]
-
-
-def pick_bucket_for_image(input_h: int, input_w: int) -> Tuple[int, int]:
-    """Return the trained bucket (H, W) closest in aspect ratio to the input.
-
-    Used for image-edit "auto" mode: instead of letting the model pick a
-    generic 1024x1024 bucket, match the input aspect ratio while capping
-    at the trained ~1MP base size. This keeps edited outputs the same shape
-    as the input (downscaled to a supported bucket if larger).
-    """
-    if input_h <= 0 or input_w <= 0:
-        return (1024, 1024)
-    import math
-    target_log_ar = math.log(input_w / input_h)
-    best = min(
-        _BUCKET_HW,
-        key=lambda hw: abs(math.log(hw[1] / hw[0]) - target_log_ar),
-    )
-    return best
 
 
 def _aggressive_vram_cleanup(model: Any, context: str = "generation") -> None:
@@ -1495,8 +1831,8 @@ class HunyuanInstructLoader:
                     "tooltip": "MoE implementation. flashinfer is faster but requires flashinfer package."
                 }),
                 "vram_reserve_gb": ("FLOAT", {
-                    "default": 30.0,
-                    "min": 5.0,
+                    "default": 8.0,
+                    "min": 1.0,
                     "max": 80.0,
                     "step": 1.0,
                     "tooltip": (
@@ -1553,6 +1889,30 @@ class HunyuanInstructLoader:
                         "via ComfyUI launch flag.)"
                     )
                 }),
+                "use_disk_offload": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "For BF16 with blocks_to_swap=0, keep most weights as memory-mapped "
+                        "files on SSD instead of requiring 150+ GB of physical RAM. "
+                        "This is experimental and extremely slow."
+                    )
+                }),
+                "disk_offload_dir": ("STRING", {
+                    "default": DEFAULT_BF16_DISK_OFFLOAD_DIR,
+                    "tooltip": "SSD directory used by Accelerate for BF16 memory-mapped offload files."
+                }),
+                "cpu_memory_limit_gb": ("INT", {
+                    "default": DEFAULT_BF16_CPU_MEMORY_LIMIT_GIB,
+                    "min": 8,
+                    "max": 192,
+                    "step": 1,
+                    "tooltip": (
+                        "Maximum physical-RAM placement budget for BF16 loading. "
+                        "Use 8–16 GB for maximum SSD offload, or 24–32 GB for "
+                        "better speed when enough RAM is free. Pagefile capacity is "
+                        "reported separately and is not counted as physical RAM."
+                    )
+                }),
             }
         }
     
@@ -1566,6 +1926,9 @@ class HunyuanInstructLoader:
         blocks_to_swap: int = 0,
         moe_drop_tokens: bool = True,
         vae_dtype: str = "bfloat16",
+        use_disk_offload: bool = True,
+        disk_offload_dir: str = DEFAULT_BF16_DISK_OFFLOAD_DIR,
+        cpu_memory_limit_gb: int = DEFAULT_BF16_CPU_MEMORY_LIMIT_GIB,
     ) -> Tuple[Any]:
         """Load the Instruct model (BF16, INT8, or NF4)."""
         from transformers import AutoModelForCausalLM
@@ -1630,6 +1993,18 @@ class HunyuanInstructLoader:
         logger.info(f"  Type: {model_info['model_type']}")
         logger.info(f"  Quantization: {quant_type}")
         logger.info(f"  Default steps: {model_info['default_steps']}")
+
+        total_vram_gib = 0.0
+        if torch.cuda.is_available():
+            total_vram_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        low_vram_mode = 0 < total_vram_gib < LOW_VRAM_THRESHOLD_GIB
+        if low_vram_mode and vram_reserve_gb > LOW_VRAM_RESERVE_GIB:
+            logger.warning(
+                f"  Low-VRAM GPU detected ({total_vram_gib:.1f} GiB). "
+                f"Clamping vram_reserve_gb from {vram_reserve_gb:.1f} to "
+                f"{LOW_VRAM_RESERVE_GIB:.1f} GiB."
+            )
+            vram_reserve_gb = LOW_VRAM_RESERVE_GIB
         
         # CRITICAL: Full Instruct models (cfg_distilled=False) use CFG with batch=2.
         # This DOUBLES all inference tensors:
@@ -1646,7 +2021,14 @@ class HunyuanInstructLoader:
             # Auto-boost vram_reserve if user left it at default and it's too low for CFG.
             # For CFG models, 30GB reserve is barely enough for bot_task=image at 1024x1024.
             # We recommend at least 40GB for safety.
-            if vram_reserve_gb <= 30.0:
+            if low_vram_mode:
+                logger.warning(
+                    "    Full Instruct CFG on a sub-24-GiB GPU is below the supported "
+                    "memory envelope. The loader will keep the reserve at the low-VRAM "
+                    "value and use SSD offload, but generation may still OOM."
+                )
+                logger.info("    TIP: Use bot_task='image', 512x512 input, and the fewest practical steps.")
+            elif vram_reserve_gb <= 30.0:
                 original_reserve = vram_reserve_gb
                 vram_reserve_gb = 40.0
                 logger.info(f"    Auto-boosted vram_reserve: {original_reserve:.0f}GB → {vram_reserve_gb:.0f}GB "
@@ -1905,37 +2287,112 @@ class HunyuanInstructLoader:
                 _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
                 model_info["is_moveable"] = True
             else:
-                # No block swap: use explicit device map to distribute across GPUs.
-                # All transformer layers stay on GPU 0 (or CPU-offloaded to GPU 0).
-                # Secondary GPUs only get VAE/vision to avoid dispatch_mask OOM.
-                logger.info("Loading BF16 Instruct model with explicit device map...")
-                logger.info(f"  Primary GPU reserve: {vram_reserve_gb:.1f}GB "
-                           f"(covers MoE dispatch_mask + KV cache for think_recaption)")
-                explicit_map, max_memory = create_device_map_for_instruct(
-                    reserve_min_gb=vram_reserve_gb,
-                    model_size_gb=160.0,  # BF16 model is ~160GB
-                )
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    attn_implementation=attention_impl,
-                    trust_remote_code=True,
-                    torch_dtype=torch.bfloat16,
-                    device_map=explicit_map,
-                    max_memory=max_memory,
-                    moe_impl=moe_impl,
-                    moe_drop_tokens=moe_drop_tokens,
-                )
+                # No block swap.  On this user's 12 GB GPU / 64 GB RAM machine,
+                # physical RAM cannot hold the ~160 GB BF16 model.  Use Accelerate's
+                # real SSD offload rather than Windows paging.
+                if use_disk_offload:
+                    logger.info("Loading BF16 Instruct model with SSD disk offload...")
+                    offload_dir, max_memory = _prepare_bf16_disk_offload(
+                        model_path=model_path,
+                        offload_root=disk_offload_dir,
+                        requested_cpu_limit_gib=cpu_memory_limit_gb,
+                        requested_vram_reserve_gib=vram_reserve_gb,
+                    )
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        attn_implementation=attention_impl,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                        max_memory=max_memory,
+                        offload_folder=offload_dir,
+                        offload_state_dict=True,
+                        low_cpu_mem_usage=True,
+                        moe_impl=moe_impl,
+                        moe_drop_tokens=moe_drop_tokens,
+                    )
+                    model_info["disk_offload"] = True
+                    model_info["offload_dir"] = offload_dir
+                else:
+                    # Original high-memory path: explicit GPU + CPU placement.
+                    logger.info("Loading BF16 Instruct model with explicit device map...")
+                    logger.info(f"  Primary GPU reserve: {vram_reserve_gb:.1f}GB "
+                               f"(covers MoE dispatch_mask + KV cache for think_recaption)")
+                    explicit_map, max_memory = create_device_map_for_instruct(
+                        reserve_min_gb=vram_reserve_gb,
+                        model_size_gb=160.0,  # BF16 model is ~160GB
+                    )
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        attn_implementation=attention_impl,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                        device_map=explicit_map,
+                        max_memory=max_memory,
+                        low_cpu_mem_usage=True,
+                        moe_impl=moe_impl,
+                        moe_drop_tokens=moe_drop_tokens,
+                    )
                 model_info["is_moveable"] = False
         
         # Log actual device placement
         if hasattr(model, 'hf_device_map'):
             devices_used = set(str(v) for v in model.hf_device_map.values())
             logger.info(f"Model distributed across: {', '.join(sorted(devices_used))}")
+            disk_modules = [name for name, dev in model.hf_device_map.items() if str(dev) == "disk"]
+            if disk_modules:
+                logger.info(f"  SSD disk offload active: {len(disk_modules)} modules mapped to disk")
+                logger.info(f"  Offload directory: {model_info.get('offload_dir', disk_offload_dir)}")
         
-        # Load tokenizer
+        # Load tokenizer.  The official Instruct config currently omits
+        # ``model_version`` while its remote ``load_tokenizer`` implementation
+        # unconditionally reads ``self.config.model_version``.  Transformers 4.x
+        # therefore raises AttributeError after the weights have loaded.  The
+        # base HunyuanImage-3.0 config uses this exact value.
         logger.info("Loading tokenizer...")
+        if not hasattr(model.config, "model_version"):
+            model.config.model_version = "HunyuanImage-3.0"
+            logger.warning(
+                "  Compatibility fix: config.model_version was missing; "
+                "using 'HunyuanImage-3.0' for tokenizer initialization."
+            )
         model.load_tokenizer(model_path)
-        
+
+        # Compatibility shim for the official Instruct remote code.  At the
+        # time of writing, modeling_hunyuan_image_3.py calls the legacy/short
+        # method name ``build_img_ratio_slice_logits_proc`` while
+        # image_processor.py exposes
+        # ``build_img_ratio_slice_logits_processor``.  Add an instance alias
+        # instead of editing the Hugging Face module cache, so the fix survives
+        # cache refreshes and remains limited to this loaded model.
+        image_processor = getattr(model, "image_processor", None)
+        if image_processor is not None:
+            legacy_ratio_builder = "build_img_ratio_slice_logits_proc"
+            current_ratio_builder = "build_img_ratio_slice_logits_processor"
+            if (
+                not hasattr(image_processor, legacy_ratio_builder)
+                and hasattr(image_processor, current_ratio_builder)
+            ):
+                setattr(
+                    image_processor,
+                    legacy_ratio_builder,
+                    getattr(image_processor, current_ratio_builder),
+                )
+                logger.warning(
+                    "  Compatibility fix: aliased image_processor."
+                    "build_img_ratio_slice_logits_proc to "
+                    "build_img_ratio_slice_logits_processor."
+                )
+
+
+        # Accelerate cannot materialize the SigLIP2 positional embedding when
+        # the official forward reads ``position_embedding.weight`` directly.
+        # Replace that one implementation with a module call so its disk/CPU
+        # offload hook runs normally.
+        if model_info.get("disk_offload"):
+            _patch_siglip2_position_embedding_for_disk_offload(model)
+            _patch_multihead_attention_offload_hooks(model)
+
         # Apply critical patches for memory management and dtype compatibility
         if SHARED_UTILS_AVAILABLE:
             logger.info("Applying dtype compatibility patches...")
@@ -1959,19 +2416,6 @@ class HunyuanInstructLoader:
             # Fix HunyuanStaticCache device mismatch on multi-GPU setups
             if patch_hunyuan_static_cache_device:
                 patch_hunyuan_static_cache_device(model)
-
-            # Fix model.device returning 'meta' when buffers are stuck on the
-            # meta device (happens with device_map="cpu" + low_cpu_mem_usage=True
-            # + block-swap). Without this, upstream prepare_model_inputs crashes
-            # with: RuntimeError: META device type not an accelerator.
-            if patch_model_device_meta_safe:
-                patch_model_device_meta_safe(model)
-
-            # Strip accelerate hooks from the VAE — it's already on a single
-            # GPU and the hook chain causes super() __class__ closure breakage
-            # across repeated invocations.
-            if strip_accelerate_hooks_from_vae:
-                strip_accelerate_hooks_from_vae(model)
         
         # Setup block swap for models with blocks_to_swap > 0
         # Works for NF4 (proven), INT8 (Int8Params.to() supports device movement),
@@ -2033,39 +2477,6 @@ class HunyuanInstructLoader:
                 _vae_dev = next(model.vae.parameters()).device
                 model.vae = model.vae.to(dtype=torch.float32)
                 logger.info(f"VAE cast to float32 (device={_vae_dev}) for higher decode precision")
-
-                # Instruct edit path: VAE-encoded conditional images flow into
-                # `model.patch_embed` (a bf16 Conv2d on the main transformer).
-                # When the VAE is fp32, the encoded latents come out in fp32 and
-                # crash patch_embed with a dtype mismatch. Wrap patch_embed to
-                # cast its input to the conv weight's dtype.
-                if hasattr(model, "patch_embed") and not getattr(
-                    model.patch_embed, "_eric_dtype_patched", False
-                ):
-                    _orig_pe_forward = model.patch_embed.forward
-
-                    def _patched_patch_embed_forward(images, *args, **kwargs):
-                        try:
-                            _w = next(model.patch_embed.parameters())
-                            _target_dtype = _w.dtype
-                            if isinstance(images, torch.Tensor) and images.dtype != _target_dtype:
-                                images = images.to(dtype=_target_dtype)
-                            elif isinstance(images, (list, tuple)):
-                                images = type(images)(
-                                    img.to(dtype=_target_dtype)
-                                    if isinstance(img, torch.Tensor) and img.dtype != _target_dtype
-                                    else img
-                                    for img in images
-                                )
-                        except StopIteration:
-                            pass
-                        return _orig_pe_forward(images, *args, **kwargs)
-
-                    model.patch_embed.forward = _patched_patch_embed_forward
-                    model.patch_embed._eric_dtype_patched = True
-                    logger.info(
-                        "Applied patch_embed input-dtype cast (fp32 VAE → bf16 patch_embed compat)"
-                    )
             except Exception as e:
                 logger.warning(f"Could not cast VAE to float32: {e}")
 
@@ -2337,22 +2748,6 @@ class HunyuanInstructGenerate:
         # from previous runs which can hold 1-4GB of VRAM
         _aggressive_vram_cleanup(model, context="T2I generation")
 
-        # Defensive: patch model.device to skip meta tensors. Idempotent
-        # (no-op if already patched). Catches models already in cache that
-        # were loaded before this fix was installed.
-        if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
-            try:
-                patch_model_device_meta_safe(model)
-            except Exception:
-                pass
-
-        # Defensive: strip accelerate hooks from VAE (idempotent).
-        if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
-            try:
-                strip_accelerate_hooks_from_vae(model)
-            except Exception:
-                pass
-
         # Propagate user VAE preferences to the patched decode wrapper (read
         # by patch_pipeline_pre_vae_cleanup at decode time).
         model._vae_tiling_mode = vae_tiling
@@ -2550,17 +2945,7 @@ class HunyuanInstructImageEdit:
                 }),
                 "align_output_size": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": (
-                        "When resolution='auto':\n"
-                        "  True (default): generate at the input image's exact "
-                        "dimensions (snapped to a multiple of 16 for VAE/patch "
-                        "alignment). The default bucket-snapping in the upstream "
-                        "image_processor is bypassed for this call so 2K+ inputs "
-                        "stay at 2K+. Higher resolutions use significantly more VRAM.\n"
-                        "  False: let upstream pick the closest trained "
-                        "aspect-ratio bucket (~1MP).\n"
-                        "Ignored when resolution is set to a specific preset."
-                    )
+                    "tooltip": "Match output size to input image size (ignored unless resolution=auto)"
                 }),
                 "resolution": (RESOLUTION_LIST, {
                     "default": "auto",
@@ -2689,22 +3074,6 @@ class HunyuanInstructImageEdit:
             
             # Aggressive VRAM cleanup before image edit - clears stale KV cache
             _aggressive_vram_cleanup(model, context="image edit")
-
-            # Defensive: patch model.device to skip meta tensors (idempotent).
-            if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
-                try:
-                    patch_model_device_meta_safe(model)
-                except Exception:
-                    pass
-
-            # Defensive: strip accelerate hooks from VAE (idempotent).
-            # Required to prevent super() __class__ closure breakage across
-            # repeated edit invocations on the cached model.
-            if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
-                try:
-                    strip_accelerate_hooks_from_vae(model)
-                except Exception:
-                    pass
             
             logger.info(f"Starting image edit with bot_task='{bot_task}' "
                         f"(this may take several minutes for recaption modes)...")
@@ -2719,262 +3088,22 @@ class HunyuanInstructImageEdit:
             # NOTE: No torch.inference_mode() — conflicts with accelerate hooks
             res_mode, height, width = parse_resolution(resolution)
             if res_mode == "auto":
-                in_h, in_w = int(image.shape[1]), int(image.shape[2])
-                if align_output_size:
-                    # Snap input dims to /16 for VAE/patch alignment, then
-                    # generate at that exact size. The actual bucket bypass
-                    # is done below via the get_target_size monkey-patch.
-                    snap = 16
-                    out_h = max(snap, (in_h // snap) * snap)
-                    out_w = max(snap, (in_w // snap) * snap)
-                    image_size = f"{out_h}x{out_w}"
-                    logger.info(
-                        f"  Resolution: {image_size} "
-                        f"(matched input {in_h}x{in_w}, snapped to /{snap})"
-                    )
-                else:
-                    image_size = "auto"
-                    logger.info(f"  Resolution: {image_size} (model picks bucket)")
-                pass_align = False
+                image_size = "auto"
             else:
                 image_size = f"{height}x{width}"
-                logger.info(f"  Resolution: {image_size}")
-                pass_align = False
-
-            # Bucket bypass + diagnostic logging.
-            #
-            # Default upstream behavior: image_processor.vae_reso_group
-            # .get_target_size(w, h) snaps any requested HxW to the closest
-            # trained aspect-ratio bucket at base_size=1024 (~1MP). To honor
-            # the caller's exact requested HxW (e.g. 2048x1360), wrap
-            # get_target_size with a passthrough. We also wrap
-            # build_gen_image_info so we can log the actual ImageInfo dims
-            # that get fed into the diffusion call. This is invaluable for
-            # tracking down where a downsample is being introduced.
-            _orig_get_target_size = None
-            _orig_build_gen_image_info = None
-            _patched_reso_group = None
-            _patched_image_processor = None
-            _trace_call_count = {"get_target_size": 0, "build_gen_image_info": 0}
-            try:
-                if hasattr(model, "image_processor"):
-                    _patched_image_processor = model.image_processor
-                    _patched_reso_group = (
-                        getattr(_patched_image_processor, "vae_reso_group", None)
-                        or getattr(_patched_image_processor, "reso_group", None)
-                    )
-
-                if _patched_reso_group is not None:
-                    _orig_get_target_size = _patched_reso_group.get_target_size
-                    _bypass_enabled = (image_size != "auto")
-
-                    def _traced_get_target_size(
-                        w, h,
-                        _rg=_patched_reso_group,
-                        _orig=_orig_get_target_size,
-                        _bypass=_bypass_enabled,
-                    ):
-                        _trace_call_count["get_target_size"] += 1
-                        n = _trace_call_count["get_target_size"]
-                        try:
-                            orig_w, orig_h = _orig(w, h)
-                        except Exception as _e:
-                            orig_w, orig_h = (None, None)
-                        if _bypass:
-                            # Snap to /16 — required by VAE/patch alignment.
-                            # vae_process_image asserts divisibility by
-                            # (h_factor, w_factor) == (16, 16). This is also
-                            # called on the cond INPUT image's origin_size
-                            # (e.g. 2325x3127), not just the gen output dims.
-                            snap = 16
-                            out_w = max(snap, (int(w) // snap) * snap)
-                            out_h = max(snap, (int(h) // snap) * snap)
-                            logger.info(
-                                f"  [trace #{n}] get_target_size(w={w}, h={h}) "
-                                f"-> bypass returns (w={out_w}, h={out_h}) "
-                                f"[snapped to /{snap}]; upstream would have "
-                                f"returned (w={orig_w}, h={orig_h})"
-                            )
-                            return out_w, out_h
-                        else:
-                            logger.info(
-                                f"  [trace #{n}] get_target_size(w={w}, h={h}) "
-                                f"-> upstream (w={orig_w}, h={orig_h}); "
-                                f"bypass disabled (image_size='auto')"
-                            )
-                            return orig_w, orig_h
-
-                    _patched_reso_group.get_target_size = _traced_get_target_size
-                    logger.info(
-                        f"  Bucket bypass: get_target_size wrapped on "
-                        f"{type(_patched_reso_group).__name__} "
-                        f"(id={id(_patched_reso_group)}, base_size="
-                        f"{getattr(_patched_reso_group, 'base_size', '?')}); "
-                        f"bypass={'enabled' if _bypass_enabled else 'disabled'}"
-                    )
-
-                if _patched_image_processor is not None and hasattr(
-                    _patched_image_processor, "build_gen_image_info"
-                ):
-                    _orig_build_gen_image_info = _patched_image_processor.build_gen_image_info
-
-                    def _traced_build_gen_image_info(
-                        image_size_arg, *a, _orig=_orig_build_gen_image_info, **kw
-                    ):
-                        _trace_call_count["build_gen_image_info"] += 1
-                        n = _trace_call_count["build_gen_image_info"]
-                        info = _orig(image_size_arg, *a, **kw)
-                        logger.info(
-                            f"  [trace #{n}] build_gen_image_info("
-                            f"image_size={image_size_arg!r}) -> ImageInfo("
-                            f"image_width={getattr(info, 'image_width', '?')}, "
-                            f"image_height={getattr(info, 'image_height', '?')}, "
-                            f"token_width={getattr(info, 'token_width', '?')}, "
-                            f"token_height={getattr(info, 'token_height', '?')}, "
-                            f"base_size={getattr(info, 'base_size', '?')}, "
-                            f"ratio_index={getattr(info, 'ratio_index', '?')})"
-                        )
-                        return info
-
-                    _patched_image_processor.build_gen_image_info = _traced_build_gen_image_info
-
-                logger.info(
-                    f"  Calling generate_image with image_size={image_size!r}, "
-                    f"bot_task={bot_task!r}, infer_align_image_size={pass_align}"
-                )
-
-                # Auto-bump max_length to fit large images. The model
-                # tokenizes each image at (W/16) * (H/16) tokens; an image
-                # edit puts BOTH a cond image AND a gen image in the
-                # sequence, plus siglip vision tokens (~1024) and the text
-                # prompt. Default generation_config.max_length is 22800,
-                # which is fine for ~1MP but overflows at 2K+ inputs.
-                #
-                # NOTE: generate_image() does NOT forward **kwargs to
-                # prepare_model_inputs (see modeling_hunyuan_image_3.py
-                # ~line 3377), so passing max_length= as a kwarg is silently
-                # dropped. We must set it on generation_config instead and
-                # restore after the call.
-                # Auto-bump BOTH `generation_config.max_length` AND
-                # `model.config.max_position_embeddings` to fit large images.
-                #
-                # `max_length` (default 22800) gates the chat-template /
-                # input prep stage (`preprocess_inputs`).
-                #
-                # `max_position_embeddings` (also 22800 in this checkpoint)
-                # is used at line ~2144 of modeling_hunyuan_image_3.py:
-                #     seqlen = self.config.max_position_embeddings
-                # and that seqlen is fed to `build_2d_rope`, which iterates
-                # image slices and computes `last_pos = L + w*h`. If
-                # `last_pos > seqlen`, the final `torch.arange(last_pos,
-                # seqlen)` raises "upper bound and lower bound inconsistent
-                # with step sign".
-                #
-                # RoPE is computed analytically from positions (no learned
-                # lookup table), so positions beyond the trained range work
-                # mechanically; quality may degrade at never-trained
-                # positions but it will run.
-                #
-                # NOTE: generate_image() does NOT forward **kwargs to
-                # prepare_model_inputs (see modeling_hunyuan_image_3.py
-                # ~line 3377/3383), so passing max_length= as a kwarg is
-                # silently dropped. We mutate the model state directly.
-                _orig_max_length = None
-                _orig_max_pos = None
-                try:
-                    if res_mode == "auto" and align_output_size:
-                        _w, _h = out_w, out_h
-                    elif res_mode == "fixed":
-                        _w, _h = int(width), int(height)
-                    else:
-                        _w, _h = None, None
-                    if _w is not None and _h is not None:
-                        per_image_tokens = (_w // 16) * (_h // 16)
-                        # cond + gen + siglip(~1024) + text/system prompt
-                        # buffer (max_new_tokens covers the worst case).
-                        needed = (
-                            2 * per_image_tokens
-                            + 1024
-                            + int(max_new_tokens or 2048)
-                            + 1024  # safety margin for chat template tokens
-                        )
-                        cfg_max = int(getattr(model.generation_config, "max_length", 22800))
-                        if needed > cfg_max:
-                            _orig_max_length = model.generation_config.max_length
-                            model.generation_config.max_length = needed
-                            logger.info(
-                                f"  Auto-bumping generation_config.max_length: "
-                                f"{cfg_max} -> {needed} (2x{per_image_tokens} "
-                                f"image tokens for {_w}x{_h} + buffers)"
-                            )
-                        # Also bump max_position_embeddings on the model
-                        # config: forward() copies it into seqlen which
-                        # feeds build_2d_rope.
-                        try:
-                            mpe_obj = model.config
-                            cur_mpe = int(getattr(mpe_obj, "max_position_embeddings", 22800))
-                            if needed > cur_mpe:
-                                _orig_max_pos = mpe_obj.max_position_embeddings
-                                mpe_obj.max_position_embeddings = needed
-                                logger.info(
-                                    f"  Auto-bumping config.max_position_embeddings: "
-                                    f"{cur_mpe} -> {needed} (RoPE will extrapolate "
-                                    f"beyond trained range; quality may degrade)"
-                                )
-                            # Invalidate cached RoPE so it recomputes with
-                            # the new seqlen on next forward.
-                            cr = getattr(model, "cached_rope", None)
-                            if cr is not None:
-                                cr.cos_cache = None
-                                cr.sin_cache = None
-                                cr.seq_len = None
-                                cr.rope_image_info = None
-                        except Exception as _e2:
-                            logger.warning(
-                                f"  max_position_embeddings auto-bump skipped: {_e2}"
-                            )
-                except Exception as _e:
-                    logger.warning(f"  max_length auto-bump skipped: {_e}")
-
-                try:
-                    result = model.generate_image(
-                        prompt=instruction,
-                        image=temp_path,  # Single image path
-                        seed=seed,
-                        image_size=image_size,
-                        use_system_prompt=use_system_prompt_value,
-                        system_prompt=custom_system_prompt,
-                        bot_task=bot_task,
-                        infer_align_image_size=pass_align,
-                        max_new_tokens=max_new_tokens,
-                        verbose=verbose,
-                    )
-                finally:
-                    if _orig_max_length is not None:
-                        model.generation_config.max_length = _orig_max_length
-                    if _orig_max_pos is not None:
-                        try:
-                            model.config.max_position_embeddings = _orig_max_pos
-                        except Exception:
-                            pass
-                        # Drop stale RoPE cache after restore too
-                        cr = getattr(model, "cached_rope", None)
-                        if cr is not None:
-                            cr.cos_cache = None
-                            cr.sin_cache = None
-                            cr.seq_len = None
-                            cr.rope_image_info = None
-            finally:
-                if _orig_get_target_size is not None and _patched_reso_group is not None:
-                    _patched_reso_group.get_target_size = _orig_get_target_size
-                if _orig_build_gen_image_info is not None and _patched_image_processor is not None:
-                    _patched_image_processor.build_gen_image_info = _orig_build_gen_image_info
-                logger.info(
-                    f"  [trace summary] get_target_size called "
-                    f"{_trace_call_count['get_target_size']}x, "
-                    f"build_gen_image_info called "
-                    f"{_trace_call_count['build_gen_image_info']}x"
-                )
+            logger.info(f"  Resolution: {image_size}")
+            result = model.generate_image(
+                prompt=instruction,
+                image=temp_path,  # Single image path
+                seed=seed,
+                image_size=image_size,
+                use_system_prompt=use_system_prompt_value,
+                system_prompt=custom_system_prompt,
+                bot_task=bot_task,
+                infer_align_image_size=align_output_size and image_size == "auto",
+                max_new_tokens=max_new_tokens,
+                verbose=verbose,
+            )
             
             # Handle return value
             if isinstance(result, tuple) and len(result) == 2:
@@ -2986,13 +3115,6 @@ class HunyuanInstructImageEdit:
             # Convert PIL to tensor
             if samples and len(samples) > 0:
                 pil_image = samples[0]
-                try:
-                    logger.info(
-                        f"  [trace] generate_image returned PIL size "
-                        f"(w={pil_image.size[0]}, h={pil_image.size[1]})"
-                    )
-                except Exception:
-                    pass
                 image_tensor = pil_to_tensor(pil_image)
             else:
                 raise RuntimeError("No image generated")
@@ -3286,20 +3408,6 @@ class HunyuanInstructMultiFusion:
             
             # Aggressive VRAM cleanup before fusion - clears stale KV cache
             _aggressive_vram_cleanup(model, context="multi-fusion")
-
-            # Defensive: patch model.device to skip meta tensors (idempotent).
-            if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
-                try:
-                    patch_model_device_meta_safe(model)
-                except Exception:
-                    pass
-
-            # Defensive: strip accelerate hooks from VAE (idempotent).
-            if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
-                try:
-                    strip_accelerate_hooks_from_vae(model)
-                except Exception:
-                    pass
             
             logger.info(f"Starting multi-image fusion with bot_task='{bot_task}' "
                         f"(this may take several minutes for recaption modes)...")
