@@ -1095,8 +1095,12 @@ def apply_nf4_transformers_compat(model) -> None:
                 except Exception:
                     inner.__call__ = inner_call  # type: ignore[assignment]
 
+        # Set the marker on the function, not the bound method: MethodType objects
+        # reject attribute assignment, so marking `bound` raises AttributeError and
+        # kills every Instruct load on transformers >=5.0 (issue #48). getattr on
+        # the bound method falls through to the function, so the guard still sees it.
+        _compat_vit_process_image._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
         bound = types.MethodType(_compat_vit_process_image, image_processor)
-        bound._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
         image_processor.vit_process_image = bound
         logger.info(
             "Patched image_processor.vit_process_image for transformers >=5.0 "
